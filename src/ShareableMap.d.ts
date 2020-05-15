@@ -8,6 +8,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private data;
     private indexView;
     private dataView;
+    private textEncoder;
+    private textDecoder;
     /**
      * Construct a new ShareableMap.
      *

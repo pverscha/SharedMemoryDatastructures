@@ -18,6 +18,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private indexView!: DataView;
     private dataView!: DataView;
 
+    private textEncoder: TextEncoder = new TextEncoder();
+    private textDecoder: TextDecoder = new TextDecoder();
+
     /**
      * Construct a new ShareableMap.
      *
@@ -165,11 +168,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private storeDataBlock(key: string, value: any) {
         const nextFree = this.freeStart;
 
-        const textEncoder = new TextEncoder();
-
         // Store key in data structure
         const keyArray: Uint8Array = new Uint8Array(this.data, nextFree + ShareableMap.DATA_OBJECT_OFFSET);
-        let writeResult = textEncoder.encodeInto(key, keyArray);
+        let writeResult = this.textEncoder.encodeInto(key, keyArray);
         const keyLength = writeResult.written ? writeResult.written : 0;
 
         let stringVal: string;
@@ -183,7 +184,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             this.data,
             nextFree + ShareableMap.DATA_OBJECT_OFFSET + keyLength
         );
-        writeResult = textEncoder.encodeInto(stringVal, valueArray);
+        writeResult = this.textEncoder.encodeInto(stringVal, valueArray);
         const valueLength = writeResult.written ? writeResult.written : 0;
 
 
@@ -217,27 +218,25 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private readKeyFromDataObject(startPos: number): string {
         const keyLength = this.dataView.getUint32(startPos + 4);
 
-        const textDecoder = new TextDecoder();
-
         const keyArray: Uint8Array = new Uint8Array(
             this.data,
             startPos + ShareableMap.DATA_OBJECT_OFFSET,
             keyLength
         );
-        return textDecoder.decode(keyArray);
+
+        return this.textDecoder.decode(keyArray);
     }
 
     private readValueFromDataObject(startPos: number): string {
         const keyLength = this.dataView.getUint32(startPos + 4);
         const valueLength = this.dataView.getUint32(startPos + 8);
 
-        const textDecoder = new TextDecoder();
         const valueArray: Uint8Array = new Uint8Array(
             this.data,
             startPos + ShareableMap.DATA_OBJECT_OFFSET + keyLength,
             valueLength
         );
-        return textDecoder.decode(valueArray);
+        return this.textDecoder.decode(valueArray);
     }
 
     private reset(expectedSize: number) {
