@@ -2,14 +2,10 @@
   "name": "sharify-js",
   "version": "0.0.1",
   "description": "JavaScript Map implementation that uses a ShareableBuffer under the hood and can be passed to workers copy-free.",
-  "main": "index.js",
+  "main": "dist/es5/index.js",
+  "module": "dist/es6/index.js",
   "scripts": {
-    "type-check": "tsc --noEmit",
-    "type-check:watch": "npm run type-check -- --watch",
-    "build": "npm run build:types && npm run build:js",
-    "build:types": "tsc --emitDeclarationOnly",
-    "build:js": "babel src --out-dir lib --extensions \".ts,.tsx\" --source-maps inline",
-    "bundle": "webpack"
+    "build": "tsc && tsc -m es6 --outDir dist/es6",
   },
   "repository": {
     "type": "git",
@@ -28,15 +24,8 @@
     "fnv-plus": "^1.3.1"
   },
   "devDependencies": {
-    "@babel/plugin-transform-runtime": "^7.9.6",
-    "@babel/preset-env": "^7.9.6",
-    "@babel/core": "^7.9.6",
-    "@babel/plugin-proposal-class-properties": "^7.8.3",
-    "@babel/plugin-proposal-object-rest-spread": "^7.9.6",
-    "@babel/preset-typescript": "^7.9.0",
     "@types/node": "^14.0.1",
-    "babel-loader": "^8.1.0",
-    "webpack": "^4.43.0",
-    "webpack-cli": "^3.3.11"
+    "typescript": "^3.9.2",
+    "webpack": "^4.43.0"
   }
 }
