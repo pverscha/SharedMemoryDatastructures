@@ -7,5 +7,11 @@ One downside to these datastructures is that they don't internally store referen
 
 ## Datastructures
 ### ShareableMap
-Partially implements the JavaScript Map interface and tries to adhere to the map principles as good as possible.
+Partially implements the JavaScript Map interface and tries to adhere to the map principles as good as possible. This map is currently aimed at setting each key, value pair once and reading the afterwards as `delete()` is not supported (and changing a key's value is also not supported).
+
+**Not supported**
+* `delete(key: K)`
+* `set(key: K, value: V)` when `key` is already present in the map.
+
+The reason for these functions that are not supported is straightforward. By deleting / changing a key's value, it's size changes which could leave empty gaps of space in the data storage array. We should fully support some form of defragmentation in order for memory requirements not to blow up in order to support the deletion and alteration of values.
 
