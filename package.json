@@ -1,11 +1,11 @@
 {
-  "name": "sharify-js",
-  "version": "0.0.1",
+  "name": "shared-memory-datastructures",
+  "version": "0.0.5",
   "description": "JavaScript Map implementation that uses a ShareableBuffer under the hood and can be passed to workers copy-free.",
-  "main": "dist/es5/index.js",
-  "module": "dist/es6/index.js",
+  "main": "dist/bundle.js",
+  "typings": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc && tsc -m es6 --outDir dist/es6",
+    "build": "webpack"
   },
   "repository": {
     "type": "git",
@@ -25,7 +25,9 @@
   },
   "devDependencies": {
     "@types/node": "^14.0.1",
+    "ts-loader": "^7.0.4",
     "typescript": "^3.9.2",
-    "webpack": "^4.43.0"
+    "webpack": "^4.43.0",
+    "webpack-cli": "^3.3.11"
   }
 }
