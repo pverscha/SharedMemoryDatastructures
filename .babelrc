@@ -4,14 +4,10 @@
             "@babel/preset-env",
             {
                 "targets": {
-                    "browsers": [
-                        "last 2 versions"
-                    ]
+                    "node": "current",
                 }
             }
         ],
-        [
-            "@babel/preset-typescript"
-        ]
+        "@babel/preset-typescript"
     ]
 }

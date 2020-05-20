@@ -20,11 +20,11 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private static readonly INVALID_VALUE = 0;
     // How many bytes for a data object are reserved for metadata? (e.g. pointer to next block, key length,
     // value length).
-    private static readonly DATA_OBJECT_OFFSET = 12;
+    private static readonly DATA_OBJECT_OFFSET = 16;
     private static readonly INDEX_TABLE_OFFSET = 16;
 
-    private index!: ArrayBuffer;
-    private data!: ArrayBuffer;
+    private index!: SharedArrayBuffer;
+    private data!: SharedArrayBuffer;
 
     private indexView!: DataView;
     private dataView!: DataView;
@@ -45,11 +45,22 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         this.reset(expectedSize, averageBytesPerValue);
     }
 
-    public getBuffers(): ArrayBuffer[] {
+    /**
+     * Get the internal buffers that represent this map and that can be transferred without cost between threads. Use
+     * setBuffers() to rebuild a ShareableMap after the buffers have been transferred.
+     */
+    public getBuffers(): SharedArrayBuffer[] {
         return [this.index, this.data];
     }
 
-    public setBuffers(indexBuffer: ArrayBuffer, dataBuffer: ArrayBuffer) {
+    /**
+     * Set the internal buffers that represent this map and that can be transferred without cost between threads.
+     *
+     * @param indexBuffer Index table buffer that's used to keep track of which values are stored where in the
+     * dataBuffer.
+     * @param dataBuffer Portion of memory in which all the data itself is stored.
+     */
+    public setBuffers(indexBuffer: SharedArrayBuffer, dataBuffer: SharedArrayBuffer) {
         this.index = indexBuffer;
         this.indexView = new DataView(this.index);
         this.data = dataBuffer;
@@ -64,8 +75,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         for (let i = 0; i < this.buckets; i++) {
             let dataPointer = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + i * ShareableMap.INT_SIZE);
             while (dataPointer !== 0) {
-                const key = this.readKeyFromDataObject(dataPointer) as unknown as K;
-                const value = this.readValueFromDataObject(dataPointer) as unknown as V;
+                const key = this.readTypedKeyFromDataObject(dataPointer);
+                const value = this.readValueFromDataObject(dataPointer);
                 yield [key, value];
                 dataPointer = this.dataView.getUint32(dataPointer);
             }
@@ -76,8 +87,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         for (let i = 0; i < this.buckets; i++) {
             let dataPointer = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + i * ShareableMap.INT_SIZE);
             while (dataPointer !== 0) {
-                // TODO fix types here
-                yield this.readKeyFromDataObject(dataPointer) as unknown as K;
+                yield this.readTypedKeyFromDataObject(dataPointer);
                 dataPointer = this.dataView.getUint32(dataPointer);
             }
         }
@@ -87,8 +97,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         for (let i = 0; i < this.buckets; i++) {
             let dataPointer = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + i * 4);
             while (dataPointer !== 0) {
-                // TODO fix types here
-                yield this.readValueFromDataObject(dataPointer) as unknown as V;
+                yield this.readValueFromDataObject(dataPointer);
                 dataPointer = this.dataView.getUint32(dataPointer);
             }
         }
@@ -124,8 +133,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         );
 
         if (returnValue) {
-            // TODO fix cast here so that it works with all types.
-            return returnValue[1] as unknown as V;
+            return returnValue[1];
         }
         return undefined;
     }
@@ -149,7 +157,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const nextFree = this.freeStart;
 
         // Pointer to next block is empty at this point
-        this.storeDataBlock(stringKey, value);
+        this.storeDataBlock(key, value);
         // Increase size
         this.increaseSize();
 
@@ -275,7 +283,15 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             while (startPos !== 0) {
                 // Read key and rehash
                 const key = this.readKeyFromDataObject(startPos);
-                const hash: number = fnv.fast1a32(key);
+
+                let keyString: string;
+                if (typeof key === "string") {
+                    keyString = key;
+                } else {
+                    keyString = JSON.stringify(key);
+                }
+
+                const hash: number = fnv.fast1a32(keyString);
 
                 const newBucket = hash % (this.buckets * 2);
 
@@ -313,8 +329,15 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * @param key The key that identifies the given value.
      * @param value The value that's associated with the given key.
      */
-    private storeDataBlock(key: string, value: any) {
+    private storeDataBlock(key: K, value: V) {
         const nextFree = this.freeStart;
+
+        let stringKey: string;
+        if (typeof key !== "string") {
+            stringKey = JSON.stringify(key);
+        } else {
+            stringKey = key;
+        }
 
         let stringVal: string;
         if (typeof value !== "string") {
@@ -324,14 +347,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         }
 
         // Determine if the data storage needs to be resized. (Every character of a string needs 2 bytes when decoded).
-        if (2 * (stringVal.length + key.length) + nextFree + ShareableMap.DATA_OBJECT_OFFSET > this.dataSize) {
+        if (2 * (stringVal.length + stringKey.length) + nextFree + ShareableMap.DATA_OBJECT_OFFSET > this.dataSize) {
             this.doubleDataStorage();
         }
 
         // Store key in data structure
-        const keyArray: ArrayBuffer = new ArrayBuffer(2 * key.length);
+        const keyArray: ArrayBuffer = new ArrayBuffer(2 * stringKey.length);
         const keyView: Uint8Array = new Uint8Array(keyArray);
-        let writeResult = this.textEncoder.encodeInto(key, keyView);
+        let writeResult = this.textEncoder.encodeInto(stringKey, keyView);
         const keyLength = writeResult.written ? writeResult.written : 0;
 
         for (let byte = 0; byte < keyLength; byte++) {
@@ -354,6 +377,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         this.dataView.setUint32(nextFree + 4, keyLength);
         // Store value length
         this.dataView.setUint32(nextFree + 8, valueLength);
+        // Keep track of key and value datatypes
+        this.dataView.setUint16(nextFree + 12, typeof key === "string" ? 1 : 0);
+        this.dataView.setUint16(nextFree + 14, typeof value === "string" ? 1 : 0);
 
         this.freeStart = nextFree + ShareableMap.DATA_OBJECT_OFFSET + keyLength + valueLength;
     }
@@ -383,7 +409,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * @return The starting position of the data object and value associated with the given key. If no such key was
      * found, undefined is returned.
      */
-    private findValue(startPos: number, key: string): [number, string] | undefined {
+    private findValue(startPos: number, key: string): [number, V] | undefined {
         while (startPos !== 0) {
             const readKey = this.readKeyFromDataObject(startPos);
             if (readKey === key) {
@@ -410,7 +436,18 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             keyView[byte] = this.dataView.getUint8(startPos + ShareableMap.DATA_OBJECT_OFFSET + byte);
         }
 
+
         return this.textDecoder.decode(keyArray);
+    }
+
+    private readTypedKeyFromDataObject(startPos: number): K {
+        const stringKey = this.readKeyFromDataObject(startPos);
+
+        if (this.dataView.getUint16(startPos + 12) === 1) {
+            return stringKey as unknown as K;
+        } else {
+            return JSON.parse(stringKey) as unknown as K;
+        }
     }
 
     /**
@@ -418,7 +455,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      *
      * @param startPos The starting position of the data object from which the associated value should be returned.
      */
-    private readValueFromDataObject(startPos: number): string {
+    private readValueFromDataObject(startPos: number): V {
         const keyLength = this.dataView.getUint32(startPos + 4);
         const valueLength = this.dataView.getUint32(startPos + 8);
 
@@ -429,7 +466,15 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             valueView[byte] = this.dataView.getUint8(startPos + ShareableMap.DATA_OBJECT_OFFSET + byte + keyLength);
         }
 
-        return this.textDecoder.decode(valueArray);
+        const stringVal = this.textDecoder.decode(valueArray);
+
+        if (this.dataView.getUint16(startPos + 14) === 1) {
+            // V should be a string in this case
+            return stringVal as unknown as V;
+        } else {
+            // V is not a string and needs to be parsed.
+            return JSON.parse(stringVal) as unknown as V;
+        }
     }
 
     /**

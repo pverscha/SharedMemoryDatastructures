@@ -2,4 +2,7 @@ node_modules
 .idea
 *.iml
 **/tsconfig.json
+typings
+webpack.config.json
 src
+test

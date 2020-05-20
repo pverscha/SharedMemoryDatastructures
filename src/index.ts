@@ -1,3 +1,3 @@
-import ShareableMap from "./Map/ShareableMap";
+import ShareableMap from "./map/ShareableMap";
 
 export { ShareableMap };
