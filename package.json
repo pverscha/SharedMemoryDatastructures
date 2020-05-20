@@ -10,7 +10,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pverscha/sharify-js.git"
+    "url": "git+https://github.com/pverscha/SharedMemoryDatastructures.git"
   },
   "keywords": [
     "Map"
@@ -18,9 +18,9 @@
   "author": "Pieter Verschaffelt",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/pverscha/sharify-js/issues"
+    "url": "https://github.com/pverscha/SharedMemoryDatastructures/issues"
   },
-  "homepage": "https://github.com/pverscha/sharify-js#readme",
+  "homepage": "https://github.com/pverscha/SharedMemoryDatastructures#readme",
   "dependencies": {
     "fnv-plus": "^1.3.1"
   },
