@@ -272,8 +272,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * location.
      */
     private doubleIndexStorage() {
-        const newIndex = new SharedArrayBuffer(this.index.byteLength * 2);
-        const newView = new DataView(newIndex, 0, this.index.byteLength * 2);
+        const newIndex = new SharedArrayBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
+        const newView = new DataView(newIndex, 0, ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
         let bucketsInUse: number = 0;
 
         // Now, we need to rehash all previous values and recompute the bucket pointers
@@ -284,15 +284,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
                 // Read key and rehash
                 const key = this.readKeyFromDataObject(startPos);
 
-                let keyString: string;
-                if (typeof key === "string") {
-                    keyString = key;
-                } else {
-                    keyString = JSON.stringify(key);
-                }
-
-                const hash: number = fnv.fast1a32(keyString);
-
+                const hash: number = fnv.fast1a32(key);
                 const newBucket = hash % (this.buckets * 2);
 
                 const currentBucketContent = newView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4);
