@@ -1,10 +1,15 @@
 import fnv from "fnv-plus";
+import Serializable from "./../encoding/Serializable";
 
 /**
  * Special implementation of the Map API that internally uses ArrayBuffers for it's data storage. These buffers can be
  * easily transferred between threads with a zero-copy cost, which allows to gain a much higher communication speed
  * between threads. You need to call `getBuffers()` and `setBuffers()` and manually transfer the buffers for this map
  * between threads to use this benefits.
+ *
+ * NOTE: When no support for SharedArrayBuffers is available, this map will automatically fall back to regular
+ * ArrayBuffers, which can also be transferred between threads (but cannot be used by multiple threads at the same
+ * time).
  *
  * Note: This Map currently does not support deleting items or changing the values that belong to a key since this
  * would require extensive memory alignment and management.
@@ -23,8 +28,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private static readonly DATA_OBJECT_OFFSET = 16;
     private static readonly INDEX_TABLE_OFFSET = 16;
 
-    private index!: SharedArrayBuffer;
-    private data!: SharedArrayBuffer;
+    private index!: ArrayBuffer;
+    private data!: ArrayBuffer;
 
     private indexView!: DataView;
     private dataView!: DataView;
@@ -39,8 +44,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * the beginning is important not to trash performance.
      * @param averageBytesPerValue What's the expected average size of one serialized value that will be stored in this
      * map?
+     * @param serializer Custom serializer to convert the objects stored in this map as a value to an ArrayBuffer and
+     * vice-versa.
      */
-    constructor(expectedSize: number = 1024, averageBytesPerValue: number = 256) {
+    constructor(
+        expectedSize: number = 1024,
+        averageBytesPerValue: number = 256,
+        private readonly serializer?: Serializable<V>
+    ) {
         super();
         this.reset(expectedSize, averageBytesPerValue);
     }
@@ -49,7 +60,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * Get the internal buffers that represent this map and that can be transferred without cost between threads. Use
      * setBuffers() to rebuild a ShareableMap after the buffers have been transferred.
      */
-    public getBuffers(): SharedArrayBuffer[] {
+    public getBuffers(): ArrayBuffer[] {
         return [this.index, this.data];
     }
 
@@ -60,7 +71,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * dataBuffer.
      * @param dataBuffer Portion of memory in which all the data itself is stored.
      */
-    public setBuffers(indexBuffer: SharedArrayBuffer, dataBuffer: SharedArrayBuffer) {
+    public setBuffers(indexBuffer: ArrayBuffer, dataBuffer: ArrayBuffer) {
         this.index = indexBuffer;
         this.indexView = new DataView(this.index);
         this.data = dataBuffer;
@@ -253,7 +264,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * new buffer. This method should be called when not enough free space is available for elements to be stored.
      */
     private doubleDataStorage() {
-        const newData = new SharedArrayBuffer(this.dataSize * 2);
+        let newData: ArrayBuffer;
+
+        try {
+            newData = new SharedArrayBuffer(this.dataSize * 2);
+        } catch (error) {
+            newData = new ArrayBuffer(this.dataSize * 2);
+        }
+
         const newView = new DataView(newData, 0, this.dataSize * 2);
 
         for (let i = 0; i < this.dataSize; i += 4) {
@@ -272,7 +290,13 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * location.
      */
     private doubleIndexStorage() {
-        const newIndex = new SharedArrayBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
+        let newIndex: ArrayBuffer;
+
+        try {
+            newIndex = new SharedArrayBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
+        } catch (error) {
+            newIndex = new ArrayBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
+        }
         const newView = new DataView(newIndex, 0, ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
         let bucketsInUse: number = 0;
 
@@ -313,6 +337,56 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         this.indexView = newView;
     }
 
+    private encodeObject(obj: any): [ArrayBuffer, number] {
+        let stringVal: string;
+        if (typeof obj !== "string") {
+            stringVal = JSON.stringify(obj);
+        } else {
+            stringVal = obj;
+        }
+
+        const buffer: ArrayBuffer = new ArrayBuffer(2 * stringVal.length);
+        const view: Uint8Array = new Uint8Array(buffer);
+
+        const keyLength = this.encodeString(stringVal, view);
+        return [buffer, keyLength];
+    }
+
+    /**
+     * Encode a string value and store into the given view. This function returns the amount of bytes that are used
+     * for the encoded string.
+     *
+     * @param stringValue String value that should be encoded into the array.
+     * @param view View of the array in which the encoded result is stored.
+     * @return The number of bytes that are used for the encoded string result.
+     */
+    private encodeString(stringValue: string, view: Uint8Array): number {
+        // Safari does not support the encodeInto function
+        if (this.textEncoder.encodeInto !== undefined) {
+            const writeResult = this.textEncoder.encodeInto(stringValue, view);
+            return writeResult.written ? writeResult.written : 0;
+        } else {
+            const encodedString = this.textEncoder.encode(stringValue);
+            for (let i = 0; i < encodedString.byteLength; i++) {
+                view[i] = encodedString[i];
+            }
+            return encodedString.byteLength;
+        }
+    }
+
+    private encodeKey(key: K): [ArrayBuffer, number] {
+        return this.encodeObject(key);
+    }
+
+    private encodeValue(value: V): [ArrayBuffer, number] {
+        if (this.serializer) {
+            const encodedBuffer = this.serializer.encode(value);
+            return [encodedBuffer, encodedBuffer.byteLength];
+        } else {
+            return this.encodeObject(value);
+        }
+    }
+
     /**
      * Allocates some space in the data array to store a new data object. Such a data object keeps track of it's
      * internal length, points to the next item in the current linked list of objects and keeps track of it's key and
@@ -324,39 +398,21 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private storeDataBlock(key: K, value: V) {
         const nextFree = this.freeStart;
 
-        let stringKey: string;
-        if (typeof key !== "string") {
-            stringKey = JSON.stringify(key);
-        } else {
-            stringKey = key;
-        }
+        const [keyBuffer, keyLength] = this.encodeKey(key);
+        const [valueBuffer, valueLength] = this.encodeValue(value);
 
-        let stringVal: string;
-        if (typeof value !== "string") {
-            stringVal = JSON.stringify(value);
-        } else {
-            stringVal = value;
-        }
+        const keyView = new Uint8Array(keyBuffer);
+        const valueView = new Uint8Array(valueBuffer);
 
         // Determine if the data storage needs to be resized. (Every character of a string needs 2 bytes when decoded).
-        if (2 * (stringVal.length + stringKey.length) + nextFree + ShareableMap.DATA_OBJECT_OFFSET > this.dataSize) {
+        if (2 * (valueLength + keyLength) + nextFree + ShareableMap.DATA_OBJECT_OFFSET > this.dataSize) {
             this.doubleDataStorage();
         }
 
         // Store key in data structure
-        const keyArray: ArrayBuffer = new ArrayBuffer(2 * stringKey.length);
-        const keyView: Uint8Array = new Uint8Array(keyArray);
-        let writeResult = this.textEncoder.encodeInto(stringKey, keyView);
-        const keyLength = writeResult.written ? writeResult.written : 0;
-
         for (let byte = 0; byte < keyLength; byte++) {
             this.dataView.setUint8(nextFree + ShareableMap.DATA_OBJECT_OFFSET + byte, keyView[byte]);
         }
-
-        const valueArray: ArrayBuffer = new ArrayBuffer(2 * stringVal.length);
-        const valueView: Uint8Array = new Uint8Array(valueArray);
-        writeResult = this.textEncoder.encodeInto(stringVal, valueView);
-        const valueLength = writeResult.written ? writeResult.written : 0;
 
         for (let byte = 0; byte < valueLength; byte++) {
             this.dataView.setUint8(
@@ -428,7 +484,6 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             keyView[byte] = this.dataView.getUint8(startPos + ShareableMap.DATA_OBJECT_OFFSET + byte);
         }
 
-
         return this.textDecoder.decode(keyArray);
     }
 
@@ -458,14 +513,16 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             valueView[byte] = this.dataView.getUint8(startPos + ShareableMap.DATA_OBJECT_OFFSET + byte + keyLength);
         }
 
-        const stringVal = this.textDecoder.decode(valueArray);
-
         if (this.dataView.getUint16(startPos + 14) === 1) {
             // V should be a string in this case
-            return stringVal as unknown as V;
+            return this.textDecoder.decode(valueArray) as unknown as V;
         } else {
-            // V is not a string and needs to be parsed.
-            return JSON.parse(stringVal) as unknown as V;
+            // V is not a string and needs to be decoded into the expected result.
+            if (this.serializer) {
+                return this.serializer.decode(valueArray);
+            } else {
+                return JSON.parse(this.textDecoder.decode(valueArray)) as unknown as V;
+            }
         }
     }
 
@@ -474,6 +531,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      *
      * @param expectedSize How many elements are expected to be stored in this map? Setting this value initially to a
      * good estimate could help with improving performance for this map.
+     * @param averageBytesPerValue how large do we expect one value element to be on average. Setting this to a good
+     * estimate can improve performance of this map.
      */
     private reset(expectedSize: number, averageBytesPerValue: number) {
         if (averageBytesPerValue % 4 !== 0) {
@@ -486,7 +545,13 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         // onto their starting position in the data array.
         const buckets = Math.ceil(expectedSize / ShareableMap.LOAD_FACTOR)
         const indexSize = 4 * 4 + buckets * ShareableMap.INT_SIZE;
-        this.index = new SharedArrayBuffer(indexSize);
+
+        try {
+            this.index = new SharedArrayBuffer(indexSize);
+        } catch (error) {
+            this.index = new ArrayBuffer(indexSize);
+        }
+
         this.indexView = new DataView(this.index, 0, indexSize);
 
         // Set buckets
@@ -496,7 +561,13 @@ export default class ShareableMap<K, V> extends Map<K, V> {
 
         // Size must be a multiple of 4
         const dataSize = averageBytesPerValue * expectedSize;
-        this.data = new SharedArrayBuffer(dataSize);
+
+        try {
+            this.data = new SharedArrayBuffer(dataSize);
+        } catch (error) {
+            this.data = new ArrayBuffer(dataSize);
+        }
+
         this.dataView = new DataView(this.data, 0, dataSize);
         // Keep track of the size of the data part of the map.
         this.indexView.setUint32(12, dataSize);
