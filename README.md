@@ -58,6 +58,8 @@ __Figure 4:__ *SharedArrayBuffers are kept in a special part of memory, called t
 Note that no serialization or deserialization operations are performed when sending `ArrayBuffer`'s or `SharedArrayBuffer`'s between workers, which leads to an additional performance increase. A downside of these buffer primitives is that you can only read and write integers to and from them. This requires us to implement the encoding of a hashmap into bytes ourselves, which is exactly what this package does for you.
 
 ### Encoding of the hashmap
+If you are not familiar with how a hashmap internally works, I suggest you take a look at this article before you continue reading on. The most important things to know about the basic inner workings of our hashmap can be seen in Figure 5.
+
 
 
 ### Performance metrics
