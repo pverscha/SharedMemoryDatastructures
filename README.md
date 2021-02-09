@@ -27,7 +27,7 @@ The reason for these functions that are not supported is straightforward. By del
 ### Introduction
 This hashmap has been implemented to circumvent the cost of copying a data structure between different workers in JavaScript. The default JavaScript implementation of a hashmap needs to be serialized on the side of the sending thread and then deserialized on the receiving side. This process takes up quite a lot of computing resources and can take a significant amount of time for large data structures. To this date, there's only one type of data structure that can be shared by multiple threads and does not need to be copied, which is the `SharedArrayBuffer`.
 
-A `SharedArrayBuffer`, however, can only be used to store binary data which makes it very hard to incorporate it in most applications. In order to simplify matters, and to provide users that require shared memory access across workers with something they're familiar with, I developed a hashmap that internally uses a `SharedArrayBuffer`. This hasmap can thus be transferred between workers with a near zero-cost and can lead to a significant speedup for complex applications.
+A `SharedArrayBuffer`, however, can only be used to store binary data which makes it very hard to incorporate it in most applications. In order to simplify matters, and to provide users that require shared memory access across workers with something they're familiar with, I developed a hashmap that internally uses a `SharedArrayBuffer`. This hasmap can thus be transferred between workers at a near zero-cost and can lead to a significant speedup for complex applications.
 
 ### Object storage model
 Before we continue, it's important to note how objects and items are represented by JavaScript. The explanation provided here is completely based upon the V8 engine (which drives Chrome, NodeJS, Electron and a lot of other software products), but will be similar for other JavaScript engines.
@@ -60,7 +60,8 @@ Note that no serialization or deserialization operations are performed when send
 ### Encoding of the hashmap
 If you are not familiar with how a hashmap internally works, I suggest you take a look at this article before you continue reading on. The most important things to know about the basic inner workings of our hashmap can be seen in Figure 5.
 
-
+![Hashmap internals](./docs/images/hashmap_internals.png)
+__Figure 5:__ *The basic hashmap principle.*
 
 ### Performance metrics
 
