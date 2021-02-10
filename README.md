@@ -58,10 +58,20 @@ __Figure 4:__ *SharedArrayBuffers are kept in a special part of memory, called t
 Note that no serialization or deserialization operations are performed when sending `ArrayBuffer`'s or `SharedArrayBuffer`'s between workers, which leads to an additional performance increase. A downside of these buffer primitives is that you can only read and write integers to and from them. This requires us to implement the encoding of a hashmap into bytes ourselves, which is exactly what this package does for you.
 
 ### Encoding of the hashmap
-If you are not familiar with how a hashmap internally works, I suggest you take a look at this article before you continue reading on. The most important things to know about the basic inner workings of our hashmap can be seen in Figure 5.
+If you are not familiar with how a hashmap internally works, I suggest you take a look at [this article](https://en.wikipedia.org/wiki/Hash_table) before you continue reading on. The most important things to know about the basic inner workings of our hashmap can be seen in Figure 5.
 
 ![Hashmap internals](./docs/images/hashmap_internals.png)
-__Figure 5:__ *The basic hashmap principle.*
+__Figure 5:__ *The basic hashmap principle. The input key is hashed using a specialized hash function. The resulting hash is then used to derive the place of this key in the index table of the hashmap. Since only a limited number of spots is available in the hashmap, multiple hashes will map onto the same position in the index table. The index table then points to the first element of a linked list with all items that belong to this position.*
+
+In order to build a fully functional hashmap, we need to store both the index table and the data of all associated objects in memory. Since the index table of a hashmap needs to be resized frequently, we chose to store the index table and the data objects in separate `SharedArrayBuffer`'s. This means that we can easily resize the index table without having to copy all of the data objects.
+
+#### Encoding of the index table
+As can be seen in Figure 5, the index table keeps track of where specific data objects are stored. Metadata that's important for the inner workings of the hashmap is also kept in the index table at a specific position.
+
+![Hashmap internals](./docs/images/hashmap_index_table.png)
+__Figure 6:__ *The index table keeps track of the hashmap's metadata (such as its size, the amount of buckets that are currently in use, etc) and points to the data objects that are stored in the hashmap. Four bytes are reserved for every type of metadata, allowing this hashmap to keep track of 2<sup>32</sup> different (key, value)-pairs.*
+
+
 
 ### Performance metrics
 
