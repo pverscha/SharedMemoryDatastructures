@@ -29,7 +29,7 @@ This hashmap has been implemented to circumvent the cost of copying a data struc
 
 A `SharedArrayBuffer`, however, can only be used to store binary data which makes it very hard to incorporate it in most applications. In order to simplify matters, and to provide users that require shared memory access across workers with something they're familiar with, I developed a hashmap that internally uses a `SharedArrayBuffer`. This hasmap can thus be transferred between workers at a near zero-cost and can lead to a significant speedup for complex applications.
 
-### Object storage model
+### JavaScript object storage model
 Before we continue, it's important to note how objects and items are represented by JavaScript. The explanation provided here is completely based upon the V8 engine (which drives Chrome, NodeJS, Electron and a lot of other software products), but will be similar for other JavaScript engines.
 
 Every new object that's created by a JavaScript-program lives on the heap. The heap is a contiguous part of memory in which objects are dynamically allocated. Internally, pointers to these objects on the heap are used to keep track of which object lives where. These pointers to objects reduce the required amount of memory for all kinds of different data structures in your JS-application. If an application, for example, constructs an array containing 10 objects, than the array itself only requires the memory to store 10 pointers (since the objects themselves are already part of the V8 heap).
@@ -71,7 +71,12 @@ As can be seen in Figure 5, the index table keeps track of where specific data o
 ![Hashmap internals](./docs/images/hashmap_index_table.png)
 __Figure 6:__ *The index table keeps track of the hashmap's metadata (such as its size, the amount of buckets that are currently in use, etc) and points to the data objects that are stored in the hashmap. Four bytes are reserved for every type of metadata, allowing this hashmap to keep track of 2<sup>32</sup> different (key, value)-pairs.*
 
+The following items are kept in the index table:
 
+* __size:__ The amount of (key, value)-pairs that are currently stored in the hashmap. Unsigned integer consisting of 4 bytes, starting at byte 0.
+* __buckets in use:__ The amount of buckets (= pointers to data objects) that are currently in use. Unsigned integer consisting of 4 bytes, starting at byte 4.
+* __start index of free space:__ Index of the next block of free space that's available in the data array.
+* __size of data array:__ Current total size (in bytes) of the `SharedArrayBuffer` that keeps track of the data objects themselves.
 
 ### Performance metrics
 
