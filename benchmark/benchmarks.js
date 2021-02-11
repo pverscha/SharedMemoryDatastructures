@@ -9,6 +9,6 @@ console.log("Performing performance measurements for default JS Map...");
 const defaultBench = new MapBenchmark(generator, generator);
 defaultBench.runBenchmark(() => new Map());
 
-console.log("Performing performance measurements for default shared memory Map...");
+console.log("Performing performance measurement+s for default shared memory Map...");
 const sharedBench = new MapBenchmark(generator, generator, [1000, 10000, 50000]);
 sharedBench.runBenchmark(() => new ShareableMap.ShareableMap());
