@@ -25,7 +25,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private static readonly INVALID_VALUE = 0;
     // How many bytes for a data object are reserved for metadata? (e.g. pointer to next block, key length,
     // value length).
-    private static readonly DATA_OBJECT_OFFSET = 16;
+    private static readonly DATA_OBJECT_OFFSET = 20;
     private static readonly INDEX_TABLE_OFFSET = 16;
 
     private index!: ArrayBuffer;
@@ -140,7 +140,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
 
         const returnValue = this.findValue(
             this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET),
-            stringKey
+            stringKey,
+            hash
         );
 
         if (returnValue) {
@@ -168,7 +169,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const nextFree = this.freeStart;
 
         // Pointer to next block is empty at this point
-        this.storeDataBlock(key, value);
+        this.storeDataBlock(key, value, hash);
         // Increase size
         this.increaseSize();
 
@@ -337,21 +338,6 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         this.indexView = newView;
     }
 
-    private encodeObject(obj: any): [ArrayBuffer, number] {
-        let stringVal: string;
-        if (typeof obj !== "string") {
-            stringVal = JSON.stringify(obj);
-        } else {
-            stringVal = obj;
-        }
-
-        const buffer: ArrayBuffer = new ArrayBuffer(2 * stringVal.length);
-        const view: Uint8Array = new Uint8Array(buffer);
-
-        const keyLength = this.encodeString(stringVal, view);
-        return [buffer, keyLength];
-    }
-
     private objectToString(obj: any): string {
         let stringVal: string;
         if (typeof obj !== "string") {
@@ -410,8 +396,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      *
      * @param key The key that identifies the given value.
      * @param value The value that's associated with the given key.
+     * @param hash The hash computed from the given key.
      */
-    private storeDataBlock(key: K, value: V) {
+    private storeDataBlock(key: K, value: V, hash: number) {
         const nextFree = this.freeStart;
 
         const keyString = this.objectToString(key);
@@ -450,6 +437,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         // Keep track of key and value datatypes
         this.dataView.setUint16(nextFree + 12, typeof key === "string" ? 1 : 0);
         this.dataView.setUint16(nextFree + 14, typeof value === "string" ? 1 : 0);
+        this.dataView.setUint32(nextFree + 16, hash);
 
         this.freeStart = nextFree + ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
     }
@@ -476,19 +464,33 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      *
      * @param startPos Position of the first data object in the linked list that should be examined.
      * @param key The key that we're currently looking for.
+     * @param hash The hash that corresponds to the key that we are currently investigating.
      * @return The starting position of the data object and value associated with the given key. If no such key was
      * found, undefined is returned.
      */
-    private findValue(startPos: number, key: string): [number, V] | undefined {
+    private findValue(
+        startPos: number,
+        key: string,
+        hash: number
+    ): [number, V] | undefined {
         while (startPos !== 0) {
-            const readKey = this.readKeyFromDataObject(startPos);
-            if (readKey === key) {
+            const readHash = this.readHashFromDataObject(startPos);
+            if (readHash === hash) {
                 return [startPos, this.readValueFromDataObject(startPos)];
             } else {
                 startPos = this.dataView.getUint32(startPos);
             }
         }
         return undefined;
+    }
+
+    /**
+     * Returns the hash associated with the data object starting at the given starting position.
+     * @param startPos
+     * @private
+     */
+    private readHashFromDataObject(startPos: number): number {
+        return this.dataView.getUint32(startPos + 16);
     }
 
     /**

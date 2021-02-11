@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+    <script src="./../dist/bundle.js"></script>
+</head>
+<body>
+    <script>
+        function generator() {
+            return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+        }
+
+        const keyValuePairs = [];
+
+        for (let i = 0; i < 1000000; i++) {
+            keyValuePairs.push([generator(), generator()]);
+        }
+
+        const map = new SharedMemoryDatastructures.ShareableMap(keyValuePairs.length);
+        // const map = new Map();
+
+        for (const [key, value] of keyValuePairs) {
+            map.set(key, value);
+        }
+
+        const startTime = new Date().getTime();
+
+        for (const [key, value] of keyValuePairs) {
+            map.get(key);
+        }
+
+        const endTime = new Date().getTime();
+
+        console.log((endTime - startTime) + "ms");
+    </script>
+</body>
+</html>
