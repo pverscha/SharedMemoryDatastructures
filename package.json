@@ -3,7 +3,6 @@
   "version": "0.1.9",
   "description": "JavaScript Map implementation that uses a ShareableBuffer under the hood and can be passed to workers copy-free.",
   "main": "dist/bundle.js",
-  "typings": "dist/index.d.ts",
   "scripts": {
     "build": "webpack",
     "test": "jest"
