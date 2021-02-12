@@ -360,8 +360,20 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private encodeString(stringValue: string, view: Uint8Array): number {
         // Safari does not support the encodeInto function
         if (this.textEncoder.encodeInto !== undefined) {
-            const writeResult = this.textEncoder.encodeInto(stringValue, view);
-            return writeResult.written ? writeResult.written : 0;
+            try {
+                const writeResult = this.textEncoder.encodeInto(stringValue, view);
+                return writeResult.written ? writeResult.written : 0;
+            } catch (error) {
+                // Try again with a separate, non-shared arraybuffer (some browsers do not accept SharedArrayBuffers
+                // for the encodeInto function yet).
+                const buffer = new Uint8Array(new ArrayBuffer(stringValue.length * 2));
+                const writeResult = this.textEncoder.encodeInto(stringValue, buffer);
+                const writeLength = writeResult.written ? writeResult.written : 0;
+                for (let i = 0; i < writeLength; i++) {
+                    view[i] = buffer[i];
+                }
+                return writeLength;
+            }
         } else {
             const encodedString = this.textEncoder.encode(stringValue);
             for (let i = 0; i < encodedString.byteLength; i++) {
@@ -523,17 +535,31 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const keyLength = this.dataView.getUint32(startPos + 4);
         const valueLength = this.dataView.getUint32(startPos + 8);
 
-        const dataView = new DataView(this.data, startPos + ShareableMap.DATA_OBJECT_OFFSET + keyLength, valueLength);
+        // Since some browsers do not support decoding from a SharedArrayBuffer, we had to disable this feature for now
+        // const dataView = new DataView(
+        //     this.data,
+        //     startPos + ShareableMap.DATA_OBJECT_OFFSET + keyLength,
+        //     valueLength
+        // );
+
+        const textView = new DataView(new ArrayBuffer(valueLength));
+
+        for (let byte = 0; byte < valueLength; byte++) {
+            textView.setUint8(
+                byte,
+                this.dataView.getUint32(startPos + ShareableMap.DATA_OBJECT_OFFSET + keyLength + byte)
+            );
+        }
 
         if (this.dataView.getUint16(startPos + 14) === 1) {
             // V should be a string in this case
-            return this.textDecoder.decode(dataView) as unknown as V;
+            return this.textDecoder.decode(textView) as unknown as V;
         } else {
             // V is not a string and needs to be decoded into the expected result.
             if (this.serializer) {
-                return this.serializer.decode(dataView);
+                return this.serializer.decode(textView);
             } else {
-                return JSON.parse(this.textDecoder.decode(dataView)) as unknown as V;
+                return JSON.parse(this.textDecoder.decode(textView)) as unknown as V;
             }
         }
     }
@@ -561,6 +587,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         try {
             this.index = new SharedArrayBuffer(indexSize);
         } catch (error) {
+            console.warn("Fallback to regular ArrayBuffer...");
             this.index = new ArrayBuffer(indexSize);
         }
 
@@ -577,6 +604,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         try {
             this.data = new SharedArrayBuffer(dataSize);
         } catch (error) {
+            console.warn("Fallback to regular ArrayBuffer...");
             this.data = new ArrayBuffer(dataSize);
         }
 

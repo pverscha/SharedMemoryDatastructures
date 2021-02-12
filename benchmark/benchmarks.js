@@ -15,8 +15,8 @@ for (let i = 0; i < 1000000; i++) {
     keyValuePairs.push([generator(), generator()]);
 }
 
-// const map = new ShareableMap.ShareableMap(keyValuePairs.length);
-const map = new Map();
+const map = new ShareableMap.ShareableMap(keyValuePairs.length);
+// const map = new Map();
 
 for (const [key, value] of keyValuePairs) {
     map.set(key, value);
