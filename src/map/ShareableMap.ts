@@ -26,6 +26,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private static readonly INT_SIZE = 4;
     // We never use 0 as a valid index value, and thus this number is used to identify free space / unused blocks.
     private static readonly INVALID_VALUE = 0;
+    // The first byte in the data array is never used
+    private static readonly INITIAL_DATA_OFFSET = 4;
     // How many bytes for a data object are reserved for metadata? (e.g. pointer to next block, key length,
     // value length).
     private static readonly DATA_OBJECT_OFFSET = 20;
@@ -130,25 +132,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     }
 
     delete(key: K): boolean {
-        let stringKey: string;
-        if (typeof key !== "string") {
-            stringKey = JSON.stringify(key);
-        } else {
-            stringKey = key;
-        }
-
-        const hash: number = fnv.fast1a32(stringKey);
-        // Bucket in which this value should be stored.
-        const bucket = (hash % this.buckets) * ShareableMap.INT_SIZE;
+        const stringKey = this.stringifyElement<K>(key);
+        const [hash, bucket] = this.computeHashAndBucket(stringKey);
 
         const bucketLink = this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET);
-        const returnValue = this.findValue(
-            bucketLink,
-            stringKey,
-            hash
-        );
+        const returnValue = this.findValue(bucketLink, stringKey, hash);
 
         if (!returnValue) {
+            // The value that should be deleted was not found, and thus cannot be deleted.
             return false;
         }
 
@@ -171,11 +162,10 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             this.dataView.setUint32(previousBlock, nextBlock);
         }
 
-        this.indexView.setUint32(
-            ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET,
-            this.indexView.getUint32(ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET) - ShareableMap.DATA_OBJECT_OFFSET - keyLength - valueLength
-        )
+        this.spaceUsedInDataPartition -= (ShareableMap.DATA_OBJECT_OFFSET + keyLength + valueLength);
 
+        // One element has been removed from the map, thus we need to decrease the size of the map.
+        this.decreaseSize();
         return true;
     }
 
@@ -184,16 +174,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     }
 
     get(key: K): V | undefined {
-        let stringKey: string;
-        if (typeof key !== "string") {
-            stringKey = JSON.stringify(key);
-        } else {
-            stringKey = key;
-        }
-
-        const hash: number = fnv.fast1a32(stringKey);
-        // Bucket in which this value should be stored.
-        const bucket = (hash % this.buckets) * ShareableMap.INT_SIZE;
+        let stringKey = this.stringifyElement<K>(key);
+        const [hash, bucket] = this.computeHashAndBucket(stringKey);
 
         const returnValue = this.findValue(
             this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET),
@@ -204,6 +186,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         if (returnValue) {
             return returnValue[1];
         }
+
         return undefined;
     }
 
@@ -212,26 +195,17 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     }
 
     set(key: K, value: V): this {
-        // Should we add a new entry or is there already an entry present?
+        // Should we add a new entry or is there already an entry present (which we need to remove first)?
         if (this.has(key)) {
             this.delete(key);
         }
 
-        let stringKey: string;
-        if (typeof key !== "string") {
-            stringKey = JSON.stringify(key);
-        } else {
-            stringKey = key;
-        }
-
-        const hash: number = fnv.fast1a32(stringKey);
-        // Bucket in which this value should be stored.
-        const bucket = (hash % this.buckets) * ShareableMap.INT_SIZE;
-
+        const stringKey: string = this.stringifyElement<K>(key);
+        const [hash, bucket] = this.computeHashAndBucket(stringKey);
 
         // Pointer to next block is empty at this point
         const startPos = this.storeDataBlock(key, value, hash);
-        // Increase size
+        // Increase size of the map since we added a new element.
         this.increaseSize();
 
         const bucketPointer = this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET);
@@ -321,23 +295,85 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         this.indexView.setUint32(ShareableMap.INDEX_SIZE_OFFSET, this.size + 1);
     }
 
+    private decreaseSize() {
+        this.indexView.setUint32(ShareableMap.INDEX_SIZE_OFFSET, this.size - 1);
+    }
+
+    private get spaceUsedInDataPartition(): number {
+        return this.indexView.getUint32(ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET);
+    }
+
+    /**
+     * Update the amount of bytes in the data array that are currently in use. These can be used to detect whether we
+     * need to perform a defragmentation step or not.
+     *
+     * @param size New amount of bytes from the data array that's currently in use.
+     */
+    private set spaceUsedInDataPartition(size: number) {
+        this.indexView.setUint32(ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET, size);
+    }
+
+    /**
+     * Returns the total amount of bytes that are available in the data space.
+     */
+    private get totalDataArraySize(): number {
+        return this.indexView.getUint32(ShareableMap.INDEX_DATA_ARRAY_SIZE_OFFSET);
+    }
+
+    private set totalDataArraySize(size: number) {
+        this.indexView.setUint32(ShareableMap.INDEX_DATA_ARRAY_SIZE_OFFSET, size);
+    }
+
+    /**
+     * Allocate a new buffer with a given capacity. This function will always try to allocate a SharedArrayBuffer (that
+     * can be used by multiple threads simultaneously). If SharedArrayBuffer's are not supported by the context in which
+     * this map is being used, a regular ArrayBuffer (that still can be transferred between threads) is used.
+     *
+     * A warning is printed to the console if this method had to fallback to regular ArrayBuffers.
+     */
+    private static allocateBuffer(bytes: number): ArrayBuffer {
+        try {
+            return new SharedArrayBuffer(bytes);
+        } catch (error) {
+            console.warn("Fallback to regular ArrayBuffer...");
+            return new ArrayBuffer(bytes);
+        }
+    }
+
+    /**
+     * Convert a given element with type T to a string. If no custom serializer has been set for this map, the built-in
+     * JSON.stringify function will be used.
+     *
+     * @param el The element that should be converted into a string.
+     */
+    private stringifyElement<T>(el: T): string {
+        let stringVal: string;
+        if (typeof el !== "string") {
+            // TODO take into account the serializer of it is set.
+            stringVal = JSON.stringify(el);
+        } else {
+            stringVal = el;
+        }
+        return stringVal;
+    }
+
+    private computeHashAndBucket(key: string): [number, number] {
+        const hash: number = fnv.fast1a32(key);
+        // Bucket in which this value should be stored.
+        const bucket = (hash % this.buckets) * ShareableMap.INT_SIZE;
+        return [hash, bucket];
+    }
+
     /**
      * Iterate over all objects in the index buffer and reposition them in the data buffer. All objects should be stored
-     * contiguous in the data buffer.
+     * contiguous in the data buffer. This is an expensive operation that involves allocating a new collection of bytes,
+     * copying and moving data around and releasing this block again from memory.
      */
     private defragment() {
-        console.log("Performing defragmentation...");
+        const newData: ArrayBuffer = ShareableMap.allocateBuffer(this.dataSize);
+        const newView = new DataView(newData);
 
-        let newData: ArrayBuffer;
-
-        try {
-            newData = new SharedArrayBuffer(this.dataSize);
-        } catch (error) {
-            newData = new ArrayBuffer(this.dataSize);
-        }
-
-        const newView = new DataView(newData, 0, this.dataSize);
-        let newOffset = 4;
+        let newOffset = ShareableMap.INITIAL_DATA_OFFSET;
 
         for (let bucket = 0; bucket < this.buckets; bucket++) {
             // Copy all objects associated with one bucket to a new data buffer.
@@ -383,16 +419,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * new buffer. This method should be called when not enough free space is available for elements to be stored.
      */
     private doubleDataStorage() {
-        console.log("Double data storage...");
-        let newData: ArrayBuffer;
-
-        try {
-            newData = new SharedArrayBuffer(this.dataSize * 2);
-        } catch (error) {
-            newData = new ArrayBuffer(this.dataSize * 2);
-        }
-
-        const newView = new DataView(newData, 0, this.dataSize * 2);
+        const newData: ArrayBuffer = ShareableMap.allocateBuffer(this.dataSize * 2);
+        const newView = new DataView(newData);
 
         for (let i = 0; i < this.dataSize; i += 4) {
             newView.setUint32(i, this.dataView.getUint32(i));
@@ -410,14 +438,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * location.
      */
     private doubleIndexStorage() {
-        let newIndex: ArrayBuffer;
+        const newIndex: ArrayBuffer = ShareableMap.allocateBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
+        const newView = new DataView(newIndex);
 
-        try {
-            newIndex = new SharedArrayBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
-        } catch (error) {
-            newIndex = new ArrayBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
-        }
-        const newView = new DataView(newIndex, 0, ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
         let bucketsInUse: number = 0;
 
         // Now, we need to rehash all previous values and recompute the bucket pointers
@@ -447,25 +470,16 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             }
         }
 
-        // Set metadata
-        newView.setUint32(0, this.indexView.getUint32(0));
+        // Copy metadata between the old and new buffer
+        for (let i = 0; i < ShareableMap.INDEX_TABLE_OFFSET; i += 4) {
+            newView.setUint32(i, this.indexView.getUint32(i));
+        }
+
+        // The buckets that are currently in use is the only thing that did change for the new index table.
         newView.setUint32(4, bucketsInUse);
-        newView.setUint32(8, this.indexView.getUint32(8));
-        newView.setUint32(12, this.indexView.getUint32(12));
 
         this.index = newIndex;
         this.indexView = newView;
-    }
-
-    private objectToString(obj: any): string {
-        let stringVal: string;
-        if (typeof obj !== "string") {
-            stringVal = JSON.stringify(obj);
-        } else {
-            stringVal = obj;
-        }
-
-        return stringVal;
     }
 
     /**
@@ -506,7 +520,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         if (this.serializer) {
             return this.serializer.encode(value, new DataView(view));
         } else {
-            const stringVal = this.objectToString(value);
+            const stringVal = this.stringifyElement<V>(value);
             return this.encodeString(stringVal, view);
         }
     }
@@ -515,7 +529,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         if (this.serializer) {
             return this.serializer.maximumLength(value);
         } else {
-            const objValue = this.objectToString(value);
+            const objValue = this.stringifyElement<V>(value);
             return objValue.length * 2;
         }
     }
@@ -531,7 +545,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * @return Original starting position.
      */
     private storeDataBlock(key: K, value: V, hash: number): number {
-        const keyString = this.objectToString(key);
+        const keyString = this.stringifyElement<K>(key);
         const maxKeyLength = keyString.length * 2;
 
         const maxValueLength = this.getEncodedValueLength(value);
@@ -540,13 +554,11 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         if (maxKeyLength + maxValueLength + this.freeStart + ShareableMap.DATA_OBJECT_OFFSET > this.dataSize) {
             // We don't have enough space left at the end of the data array. We should now consider if we should just
             // perform a defragmentation of the data array, or if we need to double the size of the array.
-            const usedSpace = this.indexView.getUint32(ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET);
-            const totalSpace = this.indexView.getUint32(ShareableMap.INDEX_DATA_ARRAY_SIZE_OFFSET);
-            const defragRatio = usedSpace / totalSpace;
+            const defragRatio = this.spaceUsedInDataPartition / this.totalDataArraySize;
 
             if (
                 defragRatio < ShareableMap.MIN_DEFRAG_FACTOR &&
-                usedSpace + maxKeyLength + maxValueLength + ShareableMap.DATA_OBJECT_OFFSET < this.dataSize
+                this.spaceUsedInDataPartition + maxKeyLength + maxValueLength + ShareableMap.DATA_OBJECT_OFFSET < this.dataSize
             ) {
                 this.defragment();
             } else {
@@ -582,13 +594,10 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         this.dataView.setUint16(this.freeStart + 14, typeof value === "string" ? 1 : 0);
         this.dataView.setUint32(this.freeStart + 16, hash);
 
-        this.indexView.setUint32(
-            ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET,
-            this.indexView.getUint32(ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET) + ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength
-        );
+        this.spaceUsedInDataPartition += ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
 
         const originalStart = this.freeStart;
-        this.freeStart = this.freeStart + ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
+        this.freeStart += ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
         return originalStart;
     }
 
@@ -725,38 +734,18 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const buckets = Math.ceil(expectedSize / ShareableMap.LOAD_FACTOR)
         const indexSize = 5 * 4 + buckets * ShareableMap.INT_SIZE;
 
-        try {
-            this.index = new SharedArrayBuffer(indexSize);
-        } catch (error) {
-            console.warn("Fallback to regular ArrayBuffer...");
-            this.index = new ArrayBuffer(indexSize);
-        }
+        this.index = ShareableMap.allocateBuffer(indexSize);
+        this.indexView = new DataView(this.index);
 
-        this.indexView = new DataView(this.index, 0, indexSize);
-
-        // Set map size
-        this.indexView.setUint32(ShareableMap.INDEX_SIZE_OFFSET, 0);
-        // Set buckets
-        this.indexView.setUint32(ShareableMap.INDEX_USED_BUCKETS_OFFSET, 0);
         // Free space starts from position 1 in the data array (instead of 0, which we use to indicate the end).
-        this.indexView.setUint32(ShareableMap.INDEX_FREE_START_INDEX_OFFSET, 4);
+        this.indexView.setUint32(ShareableMap.INDEX_FREE_START_INDEX_OFFSET, ShareableMap.INITIAL_DATA_OFFSET);
 
         // Size must be a multiple of 4
         const dataSize = averageBytesPerValue * expectedSize;
 
-        try {
-            this.data = new SharedArrayBuffer(dataSize);
-        } catch (error) {
-            console.warn("Fallback to regular ArrayBuffer...");
-            this.data = new ArrayBuffer(dataSize);
-        }
-
-        this.dataView = new DataView(this.data, 0, dataSize);
+        this.data = ShareableMap.allocateBuffer(dataSize);
+        this.dataView = new DataView(this.data);
         // Keep track of the size of the data part of the map.
         this.indexView.setUint32(ShareableMap.INDEX_DATA_ARRAY_SIZE_OFFSET, dataSize);
-
-        // Keeps track of the amount of the total space used in the datatable (this information is required for
-        // defragmentation of the data section of the memory).
-        this.indexView.setUint32(ShareableMap.INDEX_TOTAL_USED_SPACE_OFFSET, 0);
     }
 }

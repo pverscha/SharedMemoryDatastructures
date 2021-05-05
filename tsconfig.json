@@ -10,6 +10,7 @@
     "sourceMap": true,                        /* Generates corresponding '.map' file. */
     "declaration": true,
     "declarationDir": "dist",
+    "outDir": "dist",
     // "outFile": "./",                       /* Concatenate and emit output to single file. */
     // "rootDir": "./",                       /* Specify the root directory of input files. Use to control the output directory structure with --outDir. */
     // "composite": true,                     /* Enable project compilation */

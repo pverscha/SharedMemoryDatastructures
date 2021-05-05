@@ -1,7 +1,5 @@
 const ShareableMap = require("./../dist/bundle.js");
 
-const util = require("util");
-
 const map = new ShareableMap.ShareableMap(8, 32);
 map.set("a", 87);
 console.log(map.get("a"));
