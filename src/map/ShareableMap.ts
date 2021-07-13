@@ -1,9 +1,8 @@
 import { fast1a32 } from "fnv-plus";
 import Serializable from "./../encoding/Serializable";
 import StringEncoder from "./../encoding/StringEncoder";
-import IntEncoder from "./../encoding/IntEncoder";
+import NumberEncoder from "./../encoding/NumberEncoder";
 import GeneralPurposeEncoder from "./../encoding/GeneralPurposeEncoder";
-import FloatEncoder from "./../encoding/FloatEncoder";
 
 /**
  * Special implementation of the Map API that internally uses ArrayBuffers for it's data storage. These buffers can be
@@ -34,7 +33,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private static readonly INITIAL_DATA_OFFSET = 4;
     // How many bytes for a data object are reserved for metadata? (e.g. pointer to next block, key length,
     // value length).
-    private static readonly DATA_OBJECT_OFFSET = 18;
+    private static readonly DATA_OBJECT_OFFSET = 20;
     private static readonly INDEX_TABLE_OFFSET = 20;
 
     // Offsets for the different metadata entries that are kept in the index table.
@@ -53,12 +52,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private textDecoder: TextDecoder = new TextDecoder();
 
     private readonly stringEncoder = new StringEncoder();
-    private readonly intEncoder = new IntEncoder();
-    private readonly floatEncoder = new FloatEncoder();
+    private readonly numberEncoder = new NumberEncoder();
     private readonly generalPurposeEncoder = new GeneralPurposeEncoder();
-    private readonly allEncoders: Serializable<any>[];
-
-    private readonly decodeBuffer = new ArrayBuffer(1000);
 
     /**
      * Construct a new ShareableMap.
@@ -77,7 +72,6 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     ) {
         super();
         this.reset(expectedSize, averageBytesPerValue);
-        this.allEncoders = [this.intEncoder, this.floatEncoder, this.stringEncoder, this.generalPurposeEncoder, this.serializer!];
     }
 
     /**
@@ -147,13 +141,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const [hash, bucket] = this.computeHashAndBucket(stringKey);
 
         const bucketLink = this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET);
-        const startPos = this.findPosition(bucketLink, stringKey, hash);
+        const returnValue = this.findValue(bucketLink, stringKey, hash);
 
-        if (startPos === undefined) {
+        if (!returnValue) {
             // The value that should be deleted was not found, and thus cannot be deleted.
             return false;
         }
 
+        const [startPos, value] = returnValue;
         const keyLength = this.dataView.getUint32(startPos + 4);
         const valueLength = this.dataView.getUint32(startPos + 8);
 
@@ -165,7 +160,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         } else {
             let previousBlock = bucketLink;
             let currentBlock = this.dataView.getUint32(bucketLink);
-            while (this.dataView.getUint32(currentBlock + 14) !== hash) {
+            while (this.dataView.getUint32(currentBlock + 16) !== hash) {
                 previousBlock = currentBlock;
                 currentBlock = this.dataView.getUint32(currentBlock);
             }
@@ -213,7 +208,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
 
         const [hash, bucket] = this.computeHashAndBucket(keyString);
 
-        const foundPosition = this.findPosition(
+        const returnValue = this.findValue(
             this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET),
             keyString,
             hash
@@ -222,7 +217,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         let needsToBeStored = true;
         let startPos: number;
 
-        if (foundPosition !== undefined) {
+        if (returnValue) {
+            const [foundPosition, foundValue] = returnValue;
             startPos = foundPosition;
 
             // We need to check if we need to allocate a new set of space for the object (and if we thus need to remove
@@ -246,7 +242,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
 
                 // Store value length
                 this.dataView.setUint32(foundPosition + 8, exactValueLength);
-                this.dataView.setUint8(foundPosition + 13, valueEncoderId);
+                this.dataView.setUint16(foundPosition + 14, valueEncoderId);
 
                 this.spaceUsedInDataPartition += (exactValueLength - previousValueLength);
             }
@@ -293,9 +289,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             // Store value length
             this.dataView.setUint32(this.freeStart + 8, exactValueLength);
             // Keep track of key and value datatypes
-            this.dataView.setUint8(this.freeStart + 12, typeof key === "string" ? 1 : 0);
-            this.dataView.setUint8(this.freeStart + 13, valueEncoderId);
-            this.dataView.setUint32(this.freeStart + 14, hash);
+            this.dataView.setUint16(this.freeStart + 12, typeof key === "string" ? 1 : 0);
+            this.dataView.setUint16(this.freeStart + 14, valueEncoderId);
+            this.dataView.setUint32(this.freeStart + 16, hash);
 
             this.spaceUsedInDataPartition += ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
 
@@ -583,21 +579,17 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             return [this.serializer, 3];
         } else {
             if (typeof value === "number") {
-                if (Number.isInteger(value)) {
-                    return [this.intEncoder, 0];
-                } else {
-                    return [this.floatEncoder, 1];
-                }
+                return [this.numberEncoder, 0];
             } else if (typeof value === "string") {
-                return [this.stringEncoder, 2];
+                return [this.stringEncoder, 1];
             } else {
-                return [this.generalPurposeEncoder, 3];
+                return [this.generalPurposeEncoder, 2];
             }
         }
     }
 
     private getEncoderById(id: number): Serializable<any> {
-        return this.allEncoders[id];
+        return ([this.numberEncoder, this.stringEncoder, this.generalPurposeEncoder, this.serializer] as Serializable<any>[])[id];
     }
 
     /**
@@ -643,25 +635,13 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         return undefined;
     }
 
-    private findPosition(startPos: number, key: string, hash: number): number | undefined {
-        while (startPos !== 0) {
-            const readHash = this.readHashFromDataObject(startPos);
-            if (readHash === hash) {
-                return startPos;
-            } else {
-                startPos = this.dataView.getUint32(startPos);
-            }
-        }
-        return undefined;
-    }
-
     /**
      * Returns the hash associated with the data object starting at the given starting position.
      * @param startPos
      * @private
      */
     private readHashFromDataObject(startPos: number): number {
-        return this.dataView.getUint32(startPos + 14);
+        return this.dataView.getUint32(startPos + 16);
     }
 
     /**
@@ -671,21 +651,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      */
     private readKeyFromDataObject(startPos: number): string {
         const keyLength = this.dataView.getUint32(startPos + 4);
-        const textView = new DataView(new ArrayBuffer(keyLength));
-
-        for (let byte = 0; byte < keyLength; byte++) {
-            textView.setUint8(
-                byte,
-                this.dataView.getUint8(startPos + ShareableMap.DATA_OBJECT_OFFSET + byte)
-            );
-        }
-        return this.textDecoder.decode(textView);
+        const dataView = new DataView(this.data, startPos + ShareableMap.DATA_OBJECT_OFFSET, keyLength)
+        return this.textDecoder.decode(dataView);
     }
 
     private readTypedKeyFromDataObject(startPos: number): K {
         const stringKey = this.readKeyFromDataObject(startPos);
 
-        if (this.dataView.getUint8(startPos + 12) === 1) {
+        if (this.dataView.getUint16(startPos + 12) === 1) {
             return stringKey as unknown as K;
         } else {
             return JSON.parse(stringKey) as unknown as K;
@@ -701,7 +674,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const keyLength = this.dataView.getUint32(startPos + 4);
         const valueLength = this.dataView.getUint32(startPos + 8);
 
-        const encoder = this.getEncoderById(this.dataView.getUint8(startPos + 13));
+        const encoder = this.getEncoderById(this.dataView.getUint16(startPos + 14));
 
         // Since some browsers do not support decoding from a SharedArrayBuffer, we had to disable this feature for now
         // const dataView = new DataView(
@@ -710,7 +683,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         //     valueLength
         // );
 
-        const textView = new DataView(this.decodeBuffer, 0, valueLength);
+        const textView = new DataView(new ArrayBuffer(valueLength));
 
         for (let byte = 0; byte < valueLength; byte++) {
             textView.setUint8(
