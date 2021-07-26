@@ -43,11 +43,14 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     private static readonly INDEX_DATA_ARRAY_SIZE_OFFSET = 12;
     private static readonly INDEX_TOTAL_USED_SPACE_OFFSET = 16;
 
-    private index!: ArrayBuffer;
-    private data!: ArrayBuffer;
+    // Size of one memory page (in bytes), as defined by the WebAssembly standard
+    private static readonly MEMORY_PAGE_SIZE = 65536;
 
-    private indexView!: DataView;
-    private dataView!: DataView;
+    private indexMem!: WebAssembly.Memory;
+    private dataMem!: WebAssembly.Memory;
+
+    private dataDataView!: DataView;
+    private indexDataView!: DataView;
 
     private textDecoder: TextDecoder = new TextDecoder();
 
@@ -78,8 +81,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * Get the internal buffers that represent this map and that can be transferred without cost between threads. Use
      * setBuffers() to rebuild a ShareableMap after the buffers have been transferred.
      */
-    public getBuffers(): ArrayBuffer[] {
-        return [this.index, this.data];
+    public getBuffers(): WebAssembly.Memory[] {
+        return [this.indexMem, this.dataMem];
     }
 
     /**
@@ -89,11 +92,11 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * dataBuffer.
      * @param dataBuffer Portion of memory in which all the data itself is stored.
      */
-    public setBuffers(indexBuffer: ArrayBuffer, dataBuffer: ArrayBuffer) {
-        this.index = indexBuffer;
-        this.indexView = new DataView(this.index);
-        this.data = dataBuffer;
-        this.dataView = new DataView(this.data);
+    public setBuffers(indexBuffer: WebAssembly.Memory, dataBuffer: WebAssembly.Memory) {
+        this.indexMem = indexBuffer;
+        this.indexDataView = new DataView(this.indexMem.buffer);
+        this.dataMem = dataBuffer;
+        this.dataDataView = new DataView(this.dataMem.buffer);
     }
 
     [Symbol.iterator](): IterableIterator<[K, V]> {
@@ -234,7 +237,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
                 const exactValueLength = valueEncoder.encode(
                     value,
                     new Uint8Array(
-                        this.data,
+                        this.dataMem.buffer,
                         ShareableMap.DATA_OBJECT_OFFSET + foundPosition + previousKeyLength,
                         maxValueLength
                     )
@@ -269,7 +272,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             const exactKeyLength = this.stringEncoder.encode(
                 keyString,
                 new Uint8Array(
-                    this.data,
+                    this.dataMem.buffer,
                     ShareableMap.DATA_OBJECT_OFFSET + this.freeStart,
                     maxKeyLength
                 )
@@ -278,7 +281,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             const exactValueLength = valueEncoder.encode(
                 value,
                 new Uint8Array(
-                    this.data,
+                    this.dataMem.buffer,
                     ShareableMap.DATA_OBJECT_OFFSET + this.freeStart + exactKeyLength,
                     maxValueLength
                 )
@@ -323,6 +326,20 @@ export default class ShareableMap<K, V> extends Map<K, V> {
     get size() {
         // Size is being stored in the first 4 bytes of the index table
         return this.indexView.getUint32(ShareableMap.INDEX_SIZE_OFFSET);
+    }
+
+    private get dataView(): DataView {
+        if (this.dataDataView.buffer.byteLength !== this.dataMem.buffer.byteLength) {
+            this.dataDataView = new DataView(this.dataMem.buffer);
+        }
+        return this.dataDataView;
+    }
+
+    private get indexView(): DataView {
+        if (this.indexDataView.buffer.byteLength !== this.indexMem.buffer.byteLength) {
+            this.indexDataView = new DataView(this.indexMem.buffer);
+        }
+        return this.indexDataView;
     }
 
     /**
@@ -463,7 +480,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * copying and moving data around and releasing this block again from memory.
      */
     private defragment() {
-        const newData: ArrayBuffer = ShareableMap.allocateBuffer(this.dataSize);
+        const newData: ArrayBuffer = new ArrayBuffer(this.dataSize);
         const newView = new DataView(newData);
 
         let newOffset = ShareableMap.INITIAL_DATA_OFFSET;
@@ -501,8 +518,9 @@ export default class ShareableMap<K, V> extends Map<K, V> {
             }
         }
 
-        this.data = newData;
-        this.dataView = newView;
+        for (let i = 0; i < this.dataSize; i += 4) {
+            this.dataView.setUint32(i, newView.getUint32(i));
+        }
         this.freeStart = newOffset;
     }
 
@@ -511,16 +529,8 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * new buffer. This method should be called when not enough free space is available for elements to be stored.
      */
     private doubleDataStorage() {
-        const newData: ArrayBuffer = ShareableMap.allocateBuffer(this.dataSize * 2);
-        const newView = new DataView(newData);
-
-        for (let i = 0; i < this.dataSize; i += 4) {
-            newView.setUint32(i, this.dataView.getUint32(i));
-        }
-
-        this.data = newData;
-        this.dataView = newView;
-
+        // Double size of the data storage array
+        this.dataMem.grow(Math.round(this.dataMem.buffer.byteLength / ShareableMap.MEMORY_PAGE_SIZE));
         this.dataSize *= 2;
     }
 
@@ -530,8 +540,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      * location.
      */
     private doubleIndexStorage() {
-        const newIndex: ArrayBuffer = ShareableMap.allocateBuffer(ShareableMap.INDEX_TABLE_OFFSET + ShareableMap.INT_SIZE * (this.buckets * 2));
-        const newView = new DataView(newIndex);
+        this.indexMem.grow(Math.ceil((ShareableMap.INT_SIZE * (this.buckets * 2)) / ShareableMap.MEMORY_PAGE_SIZE));
 
         let bucketsInUse: number = 0;
 
@@ -546,11 +555,11 @@ export default class ShareableMap<K, V> extends Map<K, V> {
                 const hash: number = fast1a32(key);
                 const newBucket = hash % (this.buckets * 2);
 
-                const currentBucketContent = newView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4);
+                const currentBucketContent = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4);
                 // Should we directly update the bucket content or follow the links and update those?
                 if (currentBucketContent === 0) {
                     bucketsInUse++;
-                    newView.setUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4, startPos);
+                    this.indexView.setUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4, startPos);
                 } else {
                     this.updateLinkedPointer(currentBucketContent, startPos, this.dataView);
                 }
@@ -564,14 +573,11 @@ export default class ShareableMap<K, V> extends Map<K, V> {
 
         // Copy metadata between the old and new buffer
         for (let i = 0; i < ShareableMap.INDEX_TABLE_OFFSET; i += 4) {
-            newView.setUint32(i, this.indexView.getUint32(i));
+            this.indexView.setUint32(i, this.indexView.getUint32(i));
         }
 
         // The buckets that are currently in use is the only thing that did change for the new index table.
-        newView.setUint32(4, bucketsInUse);
-
-        this.index = newIndex;
-        this.indexView = newView;
+        this.indexView.setUint32(4, bucketsInUse);
     }
 
     private getEncoder(value: V): [Serializable<any>, number] {
@@ -651,7 +657,7 @@ export default class ShareableMap<K, V> extends Map<K, V> {
      */
     private readKeyFromDataObject(startPos: number): string {
         const keyLength = this.dataView.getUint32(startPos + 4);
-        const dataView = new DataView(this.data, startPos + ShareableMap.DATA_OBJECT_OFFSET, keyLength)
+        const dataView = new DataView(this.dataMem.buffer, startPos + ShareableMap.DATA_OBJECT_OFFSET, keyLength)
         return this.textDecoder.decode(dataView);
     }
 
@@ -717,18 +723,21 @@ export default class ShareableMap<K, V> extends Map<K, V> {
         const buckets = Math.ceil(expectedSize / ShareableMap.LOAD_FACTOR)
         const indexSize = 5 * 4 + buckets * ShareableMap.INT_SIZE;
 
-        this.index = ShareableMap.allocateBuffer(indexSize);
-        this.indexView = new DataView(this.index);
+        // @ts-ignore (shared is available in the most recent JS version).
+        this.indexMem = new WebAssembly.Memory({initial: Math.ceil(indexSize / ShareableMap.MEMORY_PAGE_SIZE), maximum: 65536, shared: true});
+        this.indexDataView = new DataView(this.indexMem.buffer);
 
         // Free space starts from position 1 in the data array (instead of 0, which we use to indicate the end).
         this.indexView.setUint32(ShareableMap.INDEX_FREE_START_INDEX_OFFSET, ShareableMap.INITIAL_DATA_OFFSET);
 
         // Size must be a multiple of 4
-        const dataSize = averageBytesPerValue * expectedSize;
+        const dataSizePages = Math.ceil(averageBytesPerValue * expectedSize / ShareableMap.MEMORY_PAGE_SIZE);
 
-        this.data = ShareableMap.allocateBuffer(dataSize);
-        this.dataView = new DataView(this.data);
+        // @ts-ignore (shared is available in the most recent JS version).
+        this.dataMem = new WebAssembly.Memory({initial: dataSizePages, maximum: 65536, shared: true});
+        this.dataDataView = new DataView(this.dataMem.buffer);
+
         // Keep track of the size of the data part of the map.
-        this.indexView.setUint32(ShareableMap.INDEX_DATA_ARRAY_SIZE_OFFSET, dataSize);
+        this.indexView.setUint32(ShareableMap.INDEX_DATA_ARRAY_SIZE_OFFSET, dataSizePages * ShareableMap.MEMORY_PAGE_SIZE);
     }
 }
