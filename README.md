@@ -2,10 +2,6 @@
     <img src="./docs/images/sharedcore_logo.png" alt="logo" height="200px" />
 </p>
 
-> [!IMPORTANT]  
-> This repository has been moved to [https://github.com/pverscha2/SharedCore](https://github.com/pverscha2/SharedCore)
-> All future development will take place there.
-
 ## Key features
 High-performance, thread-safe data structures for JavaScript and TypeScript, powered by SharedArrayBuffer. 
 Zero-copy, zero-hassle, shared memory at your core.
