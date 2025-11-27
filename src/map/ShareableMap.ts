@@ -1,11 +1,11 @@
 import { fast1a32 } from "fnv-plus";
-import Serializable from "./../encoding/Serializable";
-import StringEncoder from "./../encoding/StringEncoder";
-import NumberEncoder from "./../encoding/NumberEncoder";
-import GeneralPurposeEncoder from "./../encoding/GeneralPurposeEncoder";
-import ShareableMapOptions from "./ShareableMapOptions";
-import {TransferableState} from "../TransferableState";
-import TransferableDataStructure from "../TransferableDataStructure";
+import Serializable from "./../encoding/Serializable.ts";
+import StringEncoder from "./../encoding/StringEncoder.ts";
+import NumberEncoder from "./../encoding/NumberEncoder.ts";
+import GeneralPurposeEncoder from "./../encoding/GeneralPurposeEncoder.ts";
+import ShareableMapOptions from "./ShareableMapOptions.ts";
+import {TransferableState} from "../TransferableState.ts";
+import TransferableDataStructure from "../TransferableDataStructure.ts";
 
 export class ShareableMap<K, V> extends TransferableDataStructure {
     // The default load factor to which this map should adhere
@@ -123,6 +123,8 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
         const map = new ShareableMap<K, V>({...defaultOptions, ...options});
         map.setBuffers(indexBuffer, dataBuffer);
+        // Reinitialize lock state on revived map (constructor's initializeLockState did not run for replaced buffers)
+        (map as any).initializeLockState?.();
         return map;
     }
 
