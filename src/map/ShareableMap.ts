@@ -194,9 +194,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         this.acquireWriteLock();
         // Reset the index buffer. We do not need to erase the data buffer since it will simply be marked as "free space"
         // by the index (and will be overwritten eventually anyways).
-        for (let i = ShareableMap.INDEX_TABLE_OFFSET; i < this.indexView.byteLength; i += ShareableMap.INT_SIZE) {
-            this.indexView.setUint32(i, 0);
-        }
+        new Uint8Array(this.indexView.buffer, this.indexView.byteOffset, this.indexView.byteLength).fill(0, ShareableMap.INDEX_TABLE_OFFSET);
 
         // Also reset the settings that are stored in the index table
         this.indexView.setUint32(ShareableMap.INDEX_USED_BUCKETS_OFFSET, 0);
