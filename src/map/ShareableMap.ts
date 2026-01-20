@@ -3,6 +3,7 @@ import Serializable from "./../encoding/Serializable";
 import StringEncoder from "./../encoding/StringEncoder";
 import NumberEncoder from "./../encoding/NumberEncoder";
 import GeneralPurposeEncoder from "./../encoding/GeneralPurposeEncoder";
+import {SUPPORTS_SAB_VIEW_DECODE} from "../utils/featureDetection";
 import ShareableMapOptions from "./ShareableMapOptions";
 import {TransferableState} from "../TransferableState";
 import TransferableDataStructure from "../TransferableDataStructure";
@@ -730,6 +731,10 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
         const sourceView = new Uint8Array(this.dataView.buffer, startPos + ShareableMap.DATA_OBJECT_OFFSET, keyLength);
 
+        if (SUPPORTS_SAB_VIEW_DECODE) {
+            return this.textDecoder.decode(sourceView);
+        }
+
         const targetView = new Uint8Array(this.getFittingDecoderBuffer(keyLength), 0, keyLength);
         targetView.set(sourceView);
 
@@ -757,11 +762,20 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         const keyLength = this.dataView.getUint32(startPos + 4);
         const valueLength = this.dataView.getUint32(startPos + 8);
 
-        const encoder = this.getEncoderById(this.dataView.getUint16(startPos + 14));
+        const valueEncoderId = this.dataView.getUint16(startPos + 14);
+        const encoder = this.getEncoderById(valueEncoderId);
 
-        // Copy from shared memory to a temporary private buffer (since we cannot directly decode from shared memory)
         const sourceView = new Uint8Array(this.dataView.buffer, startPos + ShareableMap.DATA_OBJECT_OFFSET + keyLength, valueLength);
 
+        // Optimization: For NumberEncoder (ID 0), we can always read directly from shared memory.
+        // For others, we check if TextDecoder supports SAB views.
+        const canReadDirectly = valueEncoderId === 0 || ((valueEncoderId === 1 || valueEncoderId === 2) && SUPPORTS_SAB_VIEW_DECODE);
+
+        if (canReadDirectly) {
+            return encoder.decode(sourceView);
+        }
+
+        // Copy from shared memory to a temporary private buffer (since we cannot directly decode from shared memory)
         const targetView = new Uint8Array(this.getFittingDecoderBuffer(valueLength), 0, valueLength);
         targetView.set(sourceView);
 
