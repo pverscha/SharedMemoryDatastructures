@@ -474,12 +474,12 @@ export class ShareableArray<T> extends TransferableDataStructure {
 
         // Push all items in the index array the required amount of positions to the right (to make room for the items
         // that should be added now)
-        for (let i = this.length - 1; i >= 0; i--) {
-            this.indexView.setUint32(
-                ShareableArray.INDEX_TABLE_OFFSET + 4 * (i + items.length),
-                this.indexView.getUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * i)
-            );
-        }
+        const byteLengthToCopy = this.length * 4;
+        new Uint8Array(this.indexMem).copyWithin(
+            ShareableArray.INDEX_TABLE_OFFSET + 4 * items.length,
+            ShareableArray.INDEX_TABLE_OFFSET,
+            ShareableArray.INDEX_TABLE_OFFSET + byteLengthToCopy
+        );
 
         // Store undefined at the first positions (temporarily)
         for (let i = 0; i < items.length; i++) {
@@ -785,10 +785,17 @@ export class ShareableArray<T> extends TransferableDataStructure {
             this.doubleIndexStorage();
         }
 
-        if (index < this.length) {
-            // There is already an item at this position in the array, we have to remove the value currently present
-            // there and then update it with the new item we want to add.
-            this.deleteItem(index);
+        const isReplacement = index < this.length;
+
+        if (isReplacement) {
+            // There is already an item at this position in the array.
+            // We have to free the value currently present there.
+            const dataPos = this.indexView.getUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * index);
+            if (dataPos !== ShareableArray.UNDEFINED_VALUE_IDENTIFIER) {
+                const valueLength = this.dataView.getUint32(dataPos + 4);
+                const currentlyUsedSpace = this.indexView.getUint32(ShareableArray.INDEX_TOTAL_USED_SPACE_OFFSET);
+                this.indexView.setUint32(ShareableArray.INDEX_TOTAL_USED_SPACE_OFFSET, currentlyUsedSpace - (valueLength + ShareableArray.DATA_OBJECT_OFFSET));
+            }
         }
 
         if (item === undefined) {
@@ -834,22 +841,8 @@ export class ShareableArray<T> extends TransferableDataStructure {
             // Keep track of the exact length in bytes for this value object.
             this.dataView.setUint32(this.freeStart + 4, exactValueLength);
 
-            // Check if the item we're trying to add is at the end of the array or not
-            if (index === this.length) {
-                // Set pointer in index array to the last position.
-                this.indexView.setUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * index, this.freeStart);
-            } else {
-                // Shift all items in the array to the right to make space for the new item
-                const currentLength = this.length;
-                for (let i = currentLength; i > index; i--) {
-                    this.indexView.setUint32(
-                        ShareableArray.INDEX_TABLE_OFFSET + 4 * i,
-                        this.indexView.getUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * (i - 1))
-                    );
-                }
-                // Set the new item's position in the index array
-                this.indexView.setUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * index, this.freeStart);
-            }
+            // Set the new item's position in the index array
+            this.indexView.setUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * index, this.freeStart);
 
             // Increase the space used in the data array
             const usedSpace = this.indexView.getUint32(ShareableArray.INDEX_TOTAL_USED_SPACE_OFFSET);
@@ -859,10 +852,11 @@ export class ShareableArray<T> extends TransferableDataStructure {
             this.freeStart += exactValueLength + ShareableArray.DATA_OBJECT_OFFSET;
         }
 
-
-        // Increase the size of the array
-        const previousSize = this.indexView.getUint32(ShareableArray.INDEX_SIZE_OFFSET);
-        this.indexView.setUint32(ShareableArray.INDEX_SIZE_OFFSET, previousSize + 1);
+        if (!isReplacement) {
+            // Increase the size of the array
+            const previousSize = this.indexView.getUint32(ShareableArray.INDEX_SIZE_OFFSET);
+            this.indexView.setUint32(ShareableArray.INDEX_SIZE_OFFSET, previousSize + 1);
+        }
     }
 
     private readItem(index: number): T | undefined {
@@ -899,9 +893,14 @@ export class ShareableArray<T> extends TransferableDataStructure {
 
         // Move the items in the index array that follow the removed index forward (such that the hole in the
         // index array is removed)
-        for (let i = index; i < this.length; i++) {
-            this.indexView.setUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * i, this.indexView.getUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * (i + 1)));
-        }
+        const sourceStart = ShareableArray.INDEX_TABLE_OFFSET + 4 * (index + 1);
+        const sourceEnd = ShareableArray.INDEX_TABLE_OFFSET + 4 * this.length;
+
+        new Uint8Array(this.indexMem).copyWithin(
+            ShareableArray.INDEX_TABLE_OFFSET + 4 * index,
+            sourceStart,
+            sourceEnd
+        );
 
         if (dataPos !== ShareableArray.UNDEFINED_VALUE_IDENTIFIER) {
             const valueLength = this.dataView.getUint32(dataPos + 4);
