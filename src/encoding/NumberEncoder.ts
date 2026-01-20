@@ -2,7 +2,8 @@ import Serializable from "./Serializable";
 
 export default class NumberEncoder implements Serializable<number> {
     decode(buffer: Uint8Array): number {
-        const bufferView = new DataView(buffer.buffer);
+        // Create DataView respecting the byteOffset of the input buffer (which might be a view into a larger buffer)
+        const bufferView = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
         // First byte indicates if we did store a float or an int
         const numberType = bufferView.getUint8(0);

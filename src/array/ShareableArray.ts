@@ -3,6 +3,7 @@ import {Serializable} from "../encoding";
 import StringEncoder from "../encoding/StringEncoder";
 import NumberEncoder from "../encoding/NumberEncoder";
 import GeneralPurposeEncoder from "../encoding/GeneralPurposeEncoder";
+import {SUPPORTS_SAB_VIEW_DECODE} from "../utils/featureDetection";
 import {TransferableState} from "../TransferableState";
 import TransferableDataStructure from "../TransferableDataStructure";
 
@@ -884,14 +885,22 @@ export class ShareableArray<T> extends TransferableDataStructure {
         // Find the correct value encoder and decode the value at the requested position in the data array
         const encoder = this.getEncoderById(valueEncoderId);
 
-        // Copy from shared memory to a temporary private buffer (since we cannot directly decode from shared memory)
         const sourceView = new Uint8Array(this.dataView.buffer, dataPos + ShareableArray.DATA_OBJECT_OFFSET, valueLength);
 
-        const targetView = new Uint8Array(this.getFittingDecoderBuffer(valueLength), 0, valueLength);
-        targetView.set(sourceView);
+        // Optimization: For NumberEncoder (ID 0), we can always read directly from shared memory (via DataView).
+        // For others (String/General), we check if TextDecoder supports SAB views.
+        // We avoid direct reads for custom serializers (ID 3) as we can't guarantee they handle SAB views correctly.
+        const canReadDirectly = valueEncoderId === 0 || ((valueEncoderId === 1 || valueEncoderId === 2) && SUPPORTS_SAB_VIEW_DECODE);
 
+        if (canReadDirectly) {
+            return encoder.decode(sourceView);
+        } else {
+            // Copy from shared memory to a temporary private buffer (since we cannot directly decode from shared memory)
+            const targetView = new Uint8Array(this.getFittingDecoderBuffer(valueLength), 0, valueLength);
+            targetView.set(sourceView);
 
-        return encoder.decode(targetView);
+            return encoder.decode(targetView);
+        }
     }
 
     private deleteItem(index: number): void {
