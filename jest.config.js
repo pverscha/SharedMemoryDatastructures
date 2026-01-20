@@ -138,7 +138,7 @@ module.exports = {
 
   // The test environment that will be used for testing
   testEnvironment: "node",
-  testPathIgnorePatterns: ["/node_modules/", "/dist/", "shareableMapMixedWorker.js"],
+  testPathIgnorePatterns: ["/node_modules/", "/dist/", "shareableMapWorker.js"],
   transform: {
     "^.+\\.tsx?$": "ts-jest"
   },
