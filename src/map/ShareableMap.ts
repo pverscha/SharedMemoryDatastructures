@@ -730,6 +730,10 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
         const sourceView = new Uint8Array(this.dataView.buffer, startPos + ShareableMap.DATA_OBJECT_OFFSET, keyLength);
 
+        if (ShareableMap.SUPPORTS_SAB_VIEW) {
+            return this.textDecoder.decode(sourceView);
+        }
+
         const targetView = new Uint8Array(this.getFittingDecoderBuffer(keyLength), 0, keyLength);
         targetView.set(sourceView);
 
@@ -761,6 +765,10 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
         // Copy from shared memory to a temporary private buffer (since we cannot directly decode from shared memory)
         const sourceView = new Uint8Array(this.dataView.buffer, startPos + ShareableMap.DATA_OBJECT_OFFSET + keyLength, valueLength);
+
+        if (ShareableMap.SUPPORTS_SAB_VIEW) {
+            return encoder.decode(sourceView);
+        }
 
         const targetView = new Uint8Array(this.getFittingDecoderBuffer(valueLength), 0, valueLength);
         targetView.set(sourceView);

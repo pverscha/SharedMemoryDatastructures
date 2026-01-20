@@ -7,6 +7,19 @@ export default abstract class TransferableDataStructure {
     private decoderBuffer: ArrayBuffer = new ArrayBuffer(TransferableDataStructure.DECODER_BUFFER_SIZE);
     private currentDecoderBufferSize: number = TransferableDataStructure.DECODER_BUFFER_SIZE;
 
+    // Check if the current environment supports decoding directly from a SharedArrayBuffer view.
+    protected static readonly SUPPORTS_SAB_VIEW = (() => {
+        try {
+            if (typeof SharedArrayBuffer === "undefined") return false;
+            const sab = new SharedArrayBuffer(0);
+            const view = new Uint8Array(sab);
+            new TextDecoder().decode(view);
+            return true;
+        } catch {
+            return false;
+        }
+    })();
+
     protected allocateMemory(byteSize: number): SharedArrayBuffer | ArrayBuffer {
         try {
             return new SharedArrayBuffer(byteSize);
