@@ -945,7 +945,8 @@ export class ShareableArray<T> extends TransferableDataStructure {
      */
     private defragment() {
         const newData: ArrayBuffer = new ArrayBuffer(this.dataView.byteLength);
-        const newView = new DataView(newData);
+        const newUint8Array = new Uint8Array(newData);
+        const oldUint8Array = new Uint8Array(this.dataMem);
 
         let currentDataStart = 0;
 
@@ -956,9 +957,10 @@ export class ShareableArray<T> extends TransferableDataStructure {
             const currentObjectLength = this.dataView.getUint32(currentDataPos + 4) + ShareableArray.DATA_OBJECT_OFFSET;
 
             // Copy all bytes to the new array
-            for (let i = 0; i < currentObjectLength; i++) {
-                newView.setUint8(currentDataStart + i, this.dataView.getUint8(currentDataPos + i));
-            }
+            newUint8Array.set(
+                oldUint8Array.subarray(currentDataPos, currentDataPos + currentObjectLength),
+                currentDataStart
+            );
 
             // Update the position where this is stored in the index array
             this.indexView.setUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * i, currentDataStart);
@@ -968,8 +970,7 @@ export class ShareableArray<T> extends TransferableDataStructure {
         }
 
         // Replace the data from the old data array with the data in the array
-        const oldArray = new Uint8Array(this.dataMem);
-        oldArray.set(new Uint8Array(newData));
+        oldUint8Array.set(newUint8Array);
 
         // Update where the free space in the data array starts again
         this.freeStart = currentDataStart;
