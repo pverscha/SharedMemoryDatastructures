@@ -8,6 +8,7 @@
     "dist"
   ],
   "scripts": {
+    "dev": "vite",
     "build": "rm -rf dist && tsc && npx vite build",
     "test": "jest"
   },
