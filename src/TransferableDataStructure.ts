@@ -1,4 +1,16 @@
 export default abstract class TransferableDataStructure {
+    // Check if the current environment supports decoding directly from a SharedArrayBuffer view.
+    protected static readonly SUPPORTS_SAB_VIEW = (() => {
+        try {
+            const sab = new SharedArrayBuffer(4);
+            const view = new Uint8Array(sab);
+            new TextDecoder().decode(view);
+            return true;
+        } catch {
+            return false;
+        }
+    })();
+
     // Default size of the decoder buffer that's always reused (in bytes)
     private static readonly DECODER_BUFFER_SIZE = 16384;
 
