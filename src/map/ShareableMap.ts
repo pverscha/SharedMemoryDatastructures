@@ -535,6 +535,8 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
     private defragment() {
         const newData: ArrayBuffer = new ArrayBuffer(this.dataView.byteLength);
         const newView = new DataView(newData);
+        const newUint8 = new Uint8Array(newData);
+        const oldUint8 = new Uint8Array(this.dataMem);
 
         let newOffset = ShareableMap.INITIAL_DATA_OFFSET;
 
@@ -550,9 +552,10 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
                 const totalLength = keyLength + valueLength + ShareableMap.DATA_OBJECT_OFFSET;
 
-                for (let i = 0; i < totalLength; i++) {
-                    newView.setUint8(newOffset + i, this.dataView.getUint8(dataPointer + i));
-                }
+                newUint8.set(
+                    oldUint8.subarray(dataPointer, dataPointer + totalLength),
+                    newOffset
+                );
 
                 // Pointer to next block is zero
                 newView.setUint32(newOffset, 0);
