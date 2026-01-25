@@ -629,8 +629,36 @@ describe("ShareableArray", () => {
         expect(sorted).toBeInstanceOf(ShareableArray);
         expect(customSorted).toBeInstanceOf(ShareableArray);
     });
-    
-    
+
+    it("should correctly defragment the array", () => {
+        const array = new ShareableArray<string>();
+        const items = ["item1", "item2", "item3", "item4", "item5"];
+        items.forEach(item => array.push(item));
+
+        // Delete some items to create gaps
+        array.pop(); // delete last
+        (array as any).deleteItem(1); // delete index 1 ("item2")
+
+        // Array should have [item1, item3, item4]
+        // Indices: 0->item1, 1->item3, 2->item4
+
+        expect(array.length).toBe(3);
+        expect(array.at(0)).toBe("item1");
+        expect(array.at(1)).toBe("item3");
+        expect(array.at(2)).toBe("item4");
+
+        // Call defragment
+        (array as any).defragment();
+
+        // Verify data is still intact
+        expect(array.length).toBe(3);
+        expect(array.at(0)).toBe("item1");
+        expect(array.at(1)).toBe("item3");
+        expect(array.at(2)).toBe("item4");
+
+        // We can't easily verify memory layout without inspecting private internals,
+        // but if data retrieval works, it means defrag didn't corrupt pointers.
+    });
 });
 
 function generateRandomString() {
