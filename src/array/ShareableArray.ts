@@ -945,7 +945,8 @@ export class ShareableArray<T> extends TransferableDataStructure {
      */
     private defragment() {
         const newData: ArrayBuffer = new ArrayBuffer(this.dataView.byteLength);
-        const newView = new DataView(newData);
+        const newDataU8 = new Uint8Array(newData);
+        const oldDataU8 = new Uint8Array(this.dataMem);
 
         let currentDataStart = 0;
 
@@ -955,21 +956,25 @@ export class ShareableArray<T> extends TransferableDataStructure {
             const currentDataPos = this.indexView.getUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * i);
             const currentObjectLength = this.dataView.getUint32(currentDataPos + 4) + ShareableArray.DATA_OBJECT_OFFSET;
 
-            // Copy all bytes to the new array
-            for (let i = 0; i < currentObjectLength; i++) {
-                newView.setUint8(currentDataStart + i, this.dataView.getUint8(currentDataPos + i));
+            // Use manual copy for small blocks to avoid TypedArray view overhead.
+            // For larger blocks, use the optimized native set method.
+            if (currentObjectLength < 64) {
+                for (let i = 0; i < currentObjectLength; i++) {
+                    newDataU8[currentDataStart + i] = oldDataU8[currentDataPos + i];
+                }
+            } else {
+                newDataU8.set(oldDataU8.subarray(currentDataPos, currentDataPos + currentObjectLength), currentDataStart);
             }
 
             // Update the position where this is stored in the index array
             this.indexView.setUint32(ShareableArray.INDEX_TABLE_OFFSET + 4 * i, currentDataStart);
 
             // Update the starting position in the new defragmented array
-            currentDataStart += currentObjectLength + ShareableArray.DATA_OBJECT_OFFSET;
+            currentDataStart += currentObjectLength;
         }
 
         // Replace the data from the old data array with the data in the array
-        const oldArray = new Uint8Array(this.dataMem);
-        oldArray.set(new Uint8Array(newData));
+        oldDataU8.set(newDataU8);
 
         // Update where the free space in the data array starts again
         this.freeStart = currentDataStart;
