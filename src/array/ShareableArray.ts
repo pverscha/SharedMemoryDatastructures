@@ -887,11 +887,7 @@ export class ShareableArray<T> extends TransferableDataStructure {
         // Copy from shared memory to a temporary private buffer (since we cannot directly decode from shared memory)
         const sourceView = new Uint8Array(this.dataView.buffer, dataPos + ShareableArray.DATA_OBJECT_OFFSET, valueLength);
 
-        const targetView = new Uint8Array(this.getFittingDecoderBuffer(valueLength), 0, valueLength);
-        targetView.set(sourceView);
-
-
-        return encoder.decode(targetView);
+        return encoder.decode(sourceView);
     }
 
     private deleteItem(index: number): void {
