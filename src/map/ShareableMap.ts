@@ -168,36 +168,50 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         return this.entries();
     }
 
+    /**
+     * Returns an iterator over all [key, value] pairs in the map.
+     *
+     * **Concurrency note — snapshot iteration:**
+     * All entries are collected into a private array while a read lock is held, and the lock is
+     * released before the first value is yielded. This "snapshot" approach is intentional:
+     *
+     * - Holding the lock across `yield` points would block writers on other workers for the
+     *   entire duration of the caller's iteration, including any pauses between yields (e.g.
+     *   async work in a `for...of` body).
+     * - A generator suspended across a yield cannot reliably release the lock if it is abandoned
+     *   (e.g. the caller breaks early without exhausting the iterator), because V8 does not
+     *   guarantee that a generator's `finally` block runs at GC time.
+     *
+     * The trade-off is O(n) extra memory for the snapshot. If you do not need lazy iteration and
+     * want to avoid the allocation, use `forEach()` instead — it holds the read lock for its full
+     * duration and calls a callback for each entry without building an intermediate collection.
+     */
     * entries(): MapIterator<[K, V]> {
-        for (let i = 0; i < this.buckets; i++) {
-            let dataPointer = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + i * ShareableMap.INT_SIZE);
-            while (dataPointer !== 0) {
-                const key = this.readTypedKeyFromDataObject(dataPointer);
-                const value = this.readValueFromDataObject(dataPointer);
-                yield [key, value];
-                dataPointer = this.dataView.getUint32(dataPointer);
-            }
-        }
+        const snapshot: [K, V][] = [];
+        this.forEach((value, key) => snapshot.push([key, value]));
+        yield* snapshot;
     }
 
+    /**
+     * Returns an iterator over all keys in the map.
+     *
+     * See `entries()` for a full explanation of the snapshot-based concurrency strategy used here.
+     */
     * keys(): MapIterator<K> {
-        for (let i = 0; i < this.buckets; i++) {
-            let dataPointer = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + i * ShareableMap.INT_SIZE);
-            while (dataPointer !== 0) {
-                yield this.readTypedKeyFromDataObject(dataPointer);
-                dataPointer = this.dataView.getUint32(dataPointer);
-            }
-        }
+        const snapshot: K[] = [];
+        this.forEach((_, key) => snapshot.push(key));
+        yield* snapshot;
     }
 
+    /**
+     * Returns an iterator over all values in the map.
+     *
+     * See `entries()` for a full explanation of the snapshot-based concurrency strategy used here.
+     */
     * values(): MapIterator<V> {
-        for (let i = 0; i < this.buckets; i++) {
-            let dataPointer = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + i * 4);
-            while (dataPointer !== 0) {
-                yield this.readValueFromDataObject(dataPointer);
-                dataPointer = this.dataView.getUint32(dataPointer);
-            }
-        }
+        const snapshot: V[] = [];
+        this.forEach((value) => snapshot.push(value));
+        yield* snapshot;
     }
 
     clear(): void {
@@ -248,7 +262,11 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         } else {
             let previousBlock = bucketLink;
             let currentBlock = this.dataView.getUint32(bucketLink);
-            while (this.dataView.getUint32(currentBlock + 16) !== hash) {
+            // Walk the chain by position, not by hash. Using the stored hash to find the
+            // predecessor is incorrect when two distinct keys share the same FNV-1a hash
+            // (a full 32-bit collision): the loop would stop at the first colliding node
+            // and re-link the wrong predecessor, silently dropping an unrelated entry.
+            while (currentBlock !== startPos) {
                 previousBlock = currentBlock;
                 currentBlock = this.dataView.getUint32(currentBlock);
             }

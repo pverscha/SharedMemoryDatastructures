@@ -205,6 +205,43 @@ describe("ShareableMap", () => {
         }
     });
 
+    it("should correctly iterate entries, keys, and values", () => {
+        const map = new ShareableMap<string, number>();
+        map.set("a", 1);
+        map.set("b", 2);
+        map.set("c", 3);
+
+        expect([...map.keys()].toSorted()).toEqual(["a", "b", "c"]);
+        expect([...map.values()].toSorted((x, y) => x - y)).toEqual([1, 2, 3]);
+        expect([...map.entries()].map(([k]) => k).toSorted()).toEqual(["a", "b", "c"]);
+    });
+
+    it("should correctly delete a non-head entry that shares a bucket with other entries", () => {
+        // A small initial bucket count guarantees many hash-bucket collisions, exercising
+        // the predecessor-search path in deleteItem() for non-head chain nodes.
+        const map = new ShareableMap<string, number>({ expectedSize: 4, averageBytesPerValue: 64 });
+
+        const entries: [string, number][] = [];
+        for (let i = 0; i < 32; i++) {
+            entries.push([`collision-key-${i}`, i]);
+            map.set(`collision-key-${i}`, i);
+        }
+
+        // Delete every other entry and verify the map stays consistent.
+        for (let i = 0; i < entries.length; i += 2) {
+            expect(map.delete(entries[i][0])).toBe(true);
+        }
+
+        for (let i = 0; i < entries.length; i++) {
+            const [key, value] = entries[i];
+            if (i % 2 === 0) {
+                expect(map.has(key)).toBe(false);
+            } else {
+                expect(map.get(key)).toBe(value);
+            }
+        }
+    });
+
     it("should preserve all entries after doubleDataStorage and doubleIndexStorage are triggered", () => {
         // Small initial size (4 entries × 64 bytes = 256 byte data buffer, 4-bucket index) so both
         // growth paths are exercised within the first few hundred insertions.
