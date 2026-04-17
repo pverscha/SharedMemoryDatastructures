@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ShareableMap concurrent benchmark</title>
+</head>
+<body>
+    <p>Open the browser DevTools console to see benchmark results.</p>
+    <script type="module">
+        import { ShareableMap } from '/src/index.ts';
+
+        const INITIAL_KEY_COUNT = 50_000;
+        const OPS_PER_WORKER = 30_000;
+        const roles = ['reader', 'writer', 'mixed'];
+
+        function randomValue() {
+            return Math.random().toString(36).substring(2, 15);
+        }
+
+        // Pre-populate the shared map
+        console.log(`Pre-populating ShareableMap with ${INITIAL_KEY_COUNT.toLocaleString()} entries...`);
+        const map = new ShareableMap({ expectedSize: INITIAL_KEY_COUNT });
+        for (let i = 0; i < INITIAL_KEY_COUNT; i++) {
+            map.set(`entry-${i}`, randomValue());
+        }
+        const state = map.toTransferableState();
+        console.log('Done. Spawning 3 workers...');
+
+        // Spawn all three workers and send them their configuration
+        const workers = roles.map(role => {
+            const worker = new Worker('/benchmark/concurrent-map-worker.js', { type: 'module' });
+            worker.postMessage({
+                cmd: 'setup',
+                state,
+                role,
+                opsCount: OPS_PER_WORKER,
+                initialKeyCount: INITIAL_KEY_COUNT
+            });
+            return { worker, role };
+        });
+
+        // Collect ready signals; broadcast 'start' when all three are ready
+        let readyCount = 0;
+        let wallStart;
+        const workerResults = [];
+
+        workers.forEach(({ worker, role }) => {
+            worker.onmessage = function (event) {
+                const msg = event.data;
+
+                if (msg.status === 'ready') {
+                    readyCount++;
+                    if (readyCount === workers.length) {
+                        console.log('All workers ready — starting concurrent run...');
+                        wallStart = performance.now();
+                        workers.forEach(({ worker }) => worker.postMessage({ cmd: 'start' }));
+                    }
+                    return;
+                }
+
+                if (msg.status === 'done') {
+                    workerResults.push(msg);
+
+                    if (workerResults.length === workers.length) {
+                        const wallClockMs = performance.now() - wallStart;
+                        const totalOps = workerResults.reduce((s, r) => s + r.opsCompleted, 0);
+                        const totalOpsPerSec = Math.round(totalOps / (wallClockMs / 1000));
+
+                        console.log('---');
+                        console.log(`Concurrent — 3 workers, ${(totalOps / 1_000).toFixed(0)} K total ops`);
+
+                        // Print in the defined role order
+                        for (const role of roles) {
+                            const r = workerResults.find(x => x.role === role);
+                            console.log(
+                                `[${r.role.padEnd(7)}]  ${r.opsCompleted.toLocaleString()} ops  ` +
+                                `${r.elapsedMs.toFixed(1)} ms  ${r.opsPerSec.toLocaleString()} ops/s`
+                            );
+                        }
+
+                        console.log(`Total wall-clock: ${wallClockMs.toFixed(1)} ms  (${totalOpsPerSec.toLocaleString()} combined ops/s)`);
+                        workers.forEach(({ worker }) => worker.terminate());
+                    }
+                }
+            };
+        });
+    </script>
+</body>
+</html>

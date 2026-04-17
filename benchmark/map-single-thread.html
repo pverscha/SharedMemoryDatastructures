@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ShareableMap single-thread benchmark</title>
+</head>
+<body>
+    <p>Open the browser DevTools console to see benchmark results.</p>
+    <script type="module">
+        import { ShareableMap } from '/src/index.ts';
+
+        function randomString() {
+            return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+        }
+
+        const DATASET_SIZE = 300_000;
+        const pairs = Array.from({ length: DATASET_SIZE }, () => [randomString(), randomString()]);
+
+        function benchmarkMap(label, map, dataset) {
+            let start, elapsedMs, opsPerSec;
+
+            start = performance.now();
+            for (const [k, v] of dataset) map.set(k, v);
+            elapsedMs = performance.now() - start;
+            opsPerSec = Math.round(dataset.length / (elapsedMs / 1000));
+            console.log(`[${label}] set    ${dataset.length.toLocaleString()} ops  ${elapsedMs.toFixed(1)} ms  ${opsPerSec.toLocaleString()} ops/s`);
+
+            start = performance.now();
+            for (const [k] of dataset) map.has(k);
+            elapsedMs = performance.now() - start;
+            opsPerSec = Math.round(dataset.length / (elapsedMs / 1000));
+            console.log(`[${label}] has    ${dataset.length.toLocaleString()} ops  ${elapsedMs.toFixed(1)} ms  ${opsPerSec.toLocaleString()} ops/s`);
+
+            start = performance.now();
+            for (const [k] of dataset) map.get(k);
+            elapsedMs = performance.now() - start;
+            opsPerSec = Math.round(dataset.length / (elapsedMs / 1000));
+            console.log(`[${label}] get    ${dataset.length.toLocaleString()} ops  ${elapsedMs.toFixed(1)} ms  ${opsPerSec.toLocaleString()} ops/s`);
+
+            start = performance.now();
+            for (const [k] of dataset) map.delete(k);
+            elapsedMs = performance.now() - start;
+            opsPerSec = Math.round(dataset.length / (elapsedMs / 1000));
+            console.log(`[${label}] delete ${dataset.length.toLocaleString()} ops  ${elapsedMs.toFixed(1)} ms  ${opsPerSec.toLocaleString()} ops/s`);
+        }
+
+        console.log(`Single-thread benchmark — ${DATASET_SIZE.toLocaleString()} string key-value pairs`);
+        console.log('---');
+
+        benchmarkMap('ShareableMap', new ShareableMap({ expectedSize: DATASET_SIZE }), pairs);
+        console.log('---');
+        benchmarkMap('native Map ', new Map(), pairs);
+    </script>
+</body>
+</html>
