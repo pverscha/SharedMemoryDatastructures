@@ -7,9 +7,12 @@ export default abstract class TransferableDataStructure {
     private decoderBuffer: ArrayBuffer = new ArrayBuffer(TransferableDataStructure.DECODER_BUFFER_SIZE);
     private currentDecoderBufferSize: number = TransferableDataStructure.DECODER_BUFFER_SIZE;
 
-    protected allocateMemory(byteSize: number): SharedArrayBuffer | ArrayBuffer {
+    protected allocateMemory(byteSize: number, maxByteLength?: number): SharedArrayBuffer | ArrayBuffer {
         try {
-            return new SharedArrayBuffer(byteSize);
+            return new SharedArrayBuffer(
+                byteSize,
+                maxByteLength !== undefined ? { maxByteLength } : undefined
+            );
         } catch (err) {
             throw new Error(`Could not allocate memory. Tried to allocate ${byteSize} bytes.`);
         }

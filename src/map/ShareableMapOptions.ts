@@ -23,4 +23,12 @@ export default interface ShareableMapOptions<V> {
      * performance of the ShareableMap.
      */
     serializer?: Serializable<V>;
+
+    /**
+     * Maximum number of bytes the data buffer may grow to. Virtual address space is reserved at construction time,
+     * but physical pages are committed lazily by the OS, so a large value is inexpensive to declare.
+     *
+     * Defaults to 256 MiB. This is a hard ceiling — inserting data beyond this limit will throw a RangeError.
+     */
+    maxBytes?: number;
 };

@@ -205,6 +205,57 @@ describe("ShareableMap", () => {
         }
     });
 
+    it("should preserve all entries after doubleDataStorage and doubleIndexStorage are triggered", () => {
+        // Small initial size (4 entries × 64 bytes = 256 byte data buffer, 4-bucket index) so both
+        // growth paths are exercised within the first few hundred insertions.
+        const map = new ShareableMap<string, string>({
+            expectedSize: 4,
+            averageBytesPerValue: 64,
+            maxBytes: 256 * 1024 * 1024
+        });
+
+        const inserted = new Map<string, string>();
+        for (let i = 0; i < 500; i++) {
+            const key   = `key-${i}`;
+            const value = `value-${i}`;
+            map.set(key, value);
+            inserted.set(key, value);
+        }
+
+        expect(map.size).toBe(500);
+        for (const [key, value] of inserted) {
+            expect(map.get(key)).toBe(value);
+        }
+    });
+
+    it("should make grown data visible to a second instance sharing the same buffers", () => {
+        // Simulate two workers sharing the same SharedArrayBuffers via toTransferableState /
+        // fromTransferableState. After instance A forces a buffer grow, instance B must see
+        // all entries without any additional buffer re-sharing.
+        const mapA = new ShareableMap<string, string>({
+            expectedSize: 4,
+            averageBytesPerValue: 64,
+            maxBytes: 256 * 1024 * 1024
+        });
+
+        // Instance B shares the exact same SABs as A from the start.
+        const mapB = ShareableMap.fromTransferableState<string, string>(mapA.toTransferableState());
+
+        const inserted = new Map<string, string>();
+        for (let i = 0; i < 500; i++) {
+            const key   = `key-${i}`;
+            const value = `value-${i}`;
+            mapA.set(key, value);
+            inserted.set(key, value);
+        }
+
+        // B must see every entry written by A — no re-sharing of buffers performed.
+        expect(mapB.size).toBe(500);
+        for (const [key, value] of inserted) {
+            expect(mapB.get(key)).toBe(value);
+        }
+    });
+
     it("should correctly defragment the map if required", () => {
         const map = new ShareableMap<string, string>();
 

@@ -47,6 +47,12 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
      */
     private static readonly WRITE_LOCK_VALUE = -1;
 
+    // Default ceilings for the growable SharedArrayBuffers.
+    // Virtual address space is reserved up-front but physical pages are committed lazily,
+    // so these values are cheap to declare. Users can override maxDataBytes via ShareableMapOptions.
+    private static readonly DEFAULT_MAX_DATA_BYTES  = 256 * 1024 * 1024;  // 256 MiB
+    private static readonly DEFAULT_MAX_INDEX_BYTES =  64 * 1024 * 1024;  //  64 MiB
+
 
     private indexMem!: SharedArrayBuffer | ArrayBuffer;
     private dataMem!: SharedArrayBuffer | ArrayBuffer;
@@ -582,73 +588,81 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
     }
 
     /**
-     * Allocate a new ArrayBuffer that's twice the size of the previous buffer and copy all contents from the old to the
-     * new buffer. This method should be called when not enough free space is available for elements to be stored.
+     * Grow the data buffer to accommodate more entries. Uses SharedArrayBuffer.grow() so all workers that
+     * share the same buffer see the larger size automatically — no buffer re-sharing is required.
+     * The write lock must be held by the caller.
      */
-    private doubleDataStorage() {
-        let newDataMem: SharedArrayBuffer | ArrayBuffer;
-        if (this.dataMem.byteLength > 512 * 1024 * 1024) {
-            // Increase linearly (instead of doubling) with the size of the data array if this is larger than 512MB.
-            newDataMem = this.allocateMemory(this.dataView.byteLength + 256 * 1024 * 1024);
-        } else {
-            newDataMem = this.allocateMemory(this.dataMem.byteLength * 2);
-        }
+    private doubleDataStorage(): void {
+        // Increase linearly (instead of doubling) if the size of the data array is more than 512MiB.
+        const newSize = this.dataMem.byteLength > 512 * 1024 * 1024
+            ? this.dataMem.byteLength + 256 * 1024 * 1024
+            : this.dataMem.byteLength * 2;
 
-        // Copy the data from the old to the new buffer
-        const newDataArray = new Uint8Array(newDataMem);
-        newDataArray.set(new Uint8Array(this.dataMem));
-        this.dataMem = newDataMem;
+        // Grow in-place. Existing data is preserved; new region is zero-initialised.
+        // If newSize exceeds maxByteLength a RangeError is thrown — callers should
+        // increase maxBytes in ShareableMapOptions to avoid this.
+        (this.dataMem as SharedArrayBuffer).grow(newSize);
+
+        // Refresh this worker's DataView so its byteLength reflects the new size.
+        // Other workers' auto-length DataViews over the same SAB update automatically.
         this.dataView = new DataView(this.dataMem);
     }
 
     /**
      * Call this function if the effective load factor of the map is higher than the allowed load factor (default 0.75).
-     * This method will double the amount of available buckets and make sure all pointers are placed in the correct
-     * location.
+     * This method will double the amount of available buckets and rehash all entries.
+     *
+     * Strategy: rehash into a private ArrayBuffer (invisible to other workers), then grow the shared index SAB
+     * in-place and overwrite it with the rehashed layout. The lock word stays at the same address throughout,
+     * so workers parked in Atomics.wait() are woken correctly when the write lock is released.
+     * The write lock must be held by the caller.
      */
-    private doubleIndexStorage() {
-        const oldBuckets = this.buckets;
-        const newIndex = this.allocateMemory(ShareableMap.INT_SIZE * oldBuckets * 2);
-        const newIndexView = new DataView(newIndex);
-        const newBuckets = (newIndexView.byteLength - ShareableMap.INDEX_TABLE_OFFSET) / ShareableMap.INT_SIZE;
+    private doubleIndexStorage(): void {
+        const oldBuckets   = this.buckets;
+        const newTotalSize = ShareableMap.INDEX_TABLE_OFFSET + oldBuckets * 2 * ShareableMap.INT_SIZE;
+        const newBuckets   = oldBuckets * 2;
 
-        let bucketsInUse: number = 0;
+        // Phase 1: rehash into a private temp buffer (not shared, no synchronisation needed).
+        const tempBuf  = new ArrayBuffer(newTotalSize);
+        const tempView = new DataView(tempBuf);
+        let bucketsInUse = 0;
 
-        // Now, we need to rehash all previous values and recompute the bucket pointers
         for (let bucket = 0; bucket < oldBuckets; bucket++) {
-            let startPos = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + bucket * 4);
-
+            let startPos = this.indexView.getUint32(
+                ShareableMap.INDEX_TABLE_OFFSET + bucket * ShareableMap.INT_SIZE
+            );
             while (startPos !== 0) {
-                // Rehash
-                const hash: number = this.readHashFromDataObject(startPos);
+                const hash      = this.readHashFromDataObject(startPos);
                 const newBucket = hash % newBuckets;
-
-                const newBucketContent = newIndexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4);
-                // Should we directly update the bucket content or follow the links and update those?
-                if (newBucketContent === 0) {
+                const existing  = tempView.getUint32(
+                    ShareableMap.INDEX_TABLE_OFFSET + newBucket * ShareableMap.INT_SIZE
+                );
+                if (existing === 0) {
                     bucketsInUse++;
-                    newIndexView.setUint32(ShareableMap.INDEX_TABLE_OFFSET + newBucket * 4, startPos);
+                    tempView.setUint32(
+                        ShareableMap.INDEX_TABLE_OFFSET + newBucket * ShareableMap.INT_SIZE,
+                        startPos
+                    );
                 } else {
-                    // The bucket already exists, add the new object to the end of the chain.
-                    this.updateLinkedPointer(newBucketContent, startPos, this.dataView);
+                    this.updateLinkedPointer(existing, startPos, this.dataView);
                 }
-
-                // Follow link in the chain and update its properties.
-                const newStartPos = this.dataView.getUint32(startPos);
+                const next = this.dataView.getUint32(startPos);
                 this.dataView.setUint32(startPos, 0);
-                startPos = newStartPos;
+                startPos = next;
             }
         }
 
-        // Copy metadata between the old and new buffer
-        for (let i = 0; i < ShareableMap.INDEX_TABLE_OFFSET; i += 4) {
-            newIndexView.setUint32(i, this.indexView.getUint32(i));
+        // Copy metadata prefix (size, usedBuckets, freeStart, lock word, usedSpace) from old index.
+        for (let i = 0; i < ShareableMap.INDEX_TABLE_OFFSET; i += ShareableMap.INT_SIZE) {
+            tempView.setUint32(i, this.indexView.getUint32(i));
         }
+        tempView.setUint32(ShareableMap.INDEX_USED_BUCKETS_OFFSET, bucketsInUse);
 
-        this.indexMem = newIndex;
+        // Phase 2: grow the shared index SAB in-place, then overwrite it with the rehashed layout.
+        // The lock word at INDEX_LOCK_OFFSET remains in the same SAB — waiting workers are unaffected.
+        (this.indexMem as SharedArrayBuffer).grow(newTotalSize);
         this.indexView = new DataView(this.indexMem);
-        // The buckets that are currently in use is the only thing that did change for the new index table.
-        this.indexView.setUint32(4, bucketsInUse);
+        new Uint8Array(this.indexMem as SharedArrayBuffer).set(new Uint8Array(tempBuf));
     }
 
     private getEncoder(value: V): [Serializable<any>, number] {
@@ -799,7 +813,10 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         const buckets = Math.ceil(expectedSize / ShareableMap.LOAD_FACTOR)
         const indexSize = 5 * 4 + buckets * ShareableMap.INT_SIZE;
 
-        this.indexMem = this.allocateMemory(indexSize);
+        const maxDataBytes  = this.originalOptions.maxBytes ?? ShareableMap.DEFAULT_MAX_DATA_BYTES;
+        const maxIndexBytes = ShareableMap.DEFAULT_MAX_INDEX_BYTES;
+
+        this.indexMem = this.allocateMemory(indexSize, maxIndexBytes);
         this.indexView = new DataView(this.indexMem);
 
         // Free space starts from position 1 in the data array (instead of 0, which we use to indicate the end).
@@ -808,7 +825,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         // Size must be a multiple of 4
         const dataSize = averageBytesPerValue * expectedSize;
 
-        this.dataMem = this.allocateMemory(dataSize);
+        this.dataMem = this.allocateMemory(dataSize, maxDataBytes);
         this.dataView = new DataView(this.dataMem);
     }
 
