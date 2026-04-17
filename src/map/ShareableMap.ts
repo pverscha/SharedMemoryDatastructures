@@ -31,17 +31,21 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
     // Which position in the index array is used to check if the map is locked by other threads (=> UInt32)
     private static readonly INDEX_LOCK_OFFSET = 12;
     private static readonly INDEX_TOTAL_USED_SPACE_OFFSET = 16;
-    // Which position in the index array is used to count the amount of held read locks (=> UInt32)
-    private static readonly INDEX_READ_COUNT_OFFSET = 20;
+    // Bytes 20-23 (offset 20) were previously used for a separate read-count field.
+    // The combined lock word at INDEX_LOCK_OFFSET now encodes both the writer flag and the
+    // active reader count in a single Int32, so this slot is reserved / unused.
 
     /**
-     * Lock states for the ShareableMap
+     * The single lock word encoding:
+     *   -1  → exclusive write lock held
+     *    0  → unlocked
+     *   N>0 → N active concurrent readers
+     *
+     * Encoding both state and reader count in one Int32 makes "check no writer +
+     * register as reader" a single compareExchange — eliminating the TOCTOU window
+     * that existed when a separate INDEX_READ_COUNT_OFFSET field was used.
      */
-    private static readonly LOCK_STATE = {
-        UNLOCKED: 0,      // No locks held
-        WRITE_LOCKED: 1,  // Exclusive write lock
-        READ_LOCKED: 2    // One or more read locks
-    };
+    private static readonly WRITE_LOCK_VALUE = -1;
 
 
     private indexMem!: SharedArrayBuffer | ArrayBuffer;
@@ -812,45 +816,51 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
      * Acquires a read lock on the map. Multiple readers can hold read locks simultaneously,
      * but no writers can access the map while any read locks are held.
      *
-     * @param timeout Optional timeout in milliseconds. If not provided, will wait indefinitely.
-     * @returns true if the lock was acquired, false if it timed out
+     * The lock word encodes both state and reader count in a single Int32:
+     *   -1  → write lock held (readers must wait)
+     *    0  → unlocked
+     *   N>0 → N active readers
+     *
+     * A CAS loop is used so that "verify no writer is present" and "register as a reader"
+     * are a single atomic operation, eliminating any TOCTOU window.
+     *
+     * @param timeout Optional timeout in milliseconds. Defaults to 500ms.
+     * @returns true if the lock was acquired
+     * @throws if the timeout expires before the lock is acquired
      */
     private acquireReadLock(timeout: number = 500): boolean {
         if (!(this.indexMem instanceof SharedArrayBuffer)) {
-            // Locking only works with SharedArrayBuffer
             return true;
         }
 
         const int32Array = new Int32Array(this.indexMem);
-
-        // Wait until there are no write locks
+        const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
         const startTime = Date.now();
+
         while (true) {
-            // Check if there's a write lock
-            const currentState = Atomics.load(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4);
+            const current = Atomics.load(int32Array, lockIdx);
 
-            if (currentState !== ShareableMap.LOCK_STATE.WRITE_LOCKED) {
-                // No write lock, try to update the state and increment read count
-                const readCount = Atomics.add(int32Array, ShareableMap.INDEX_READ_COUNT_OFFSET / 4, 1) + 1;
-
-                // If this is the first read lock, update the state
-                if (readCount === 1) {
-                    Atomics.store(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, ShareableMap.LOCK_STATE.READ_LOCKED);
+            if (current >= 0) {
+                // No writer present. Atomically register as a reader by incrementing the
+                // lock word from `current` to `current + 1`. If another thread changed the
+                // value between the load and the CAS (e.g. a writer arrived, or another
+                // reader incremented first), the CAS will fail and we retry — no window
+                // exists for a writer to hold its lock while we incorrectly proceed.
+                const observed = Atomics.compareExchange(int32Array, lockIdx, current, current + 1);
+                if (observed === current) {
+                    return true; // CAS succeeded — we are now registered as a reader
                 }
-
-                return true;
+                // CAS failed: another thread raced us; spin immediately without sleeping
+                continue;
             }
 
-            // If we have a timeout and it's expired, return false
-            if (timeout !== undefined && (Date.now() - startTime) >= timeout) {
+            // Write lock is held (current === WRITE_LOCK_VALUE); park until it is released
+            const elapsed = Date.now() - startTime;
+            if (elapsed >= timeout) {
                 throw new Error("ShareableMap: timeout expired while waiting for read lock.");
             }
 
-            // Wait for a notification that the write lock might be released
-            // We use "not-equal" because we want to wake up when the state changes from WRITE_LOCKED
-            Atomics.wait(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4,
-                ShareableMap.LOCK_STATE.WRITE_LOCKED,
-                timeout === undefined ? Infinity : timeout - (Date.now() - startTime));
+            Atomics.wait(int32Array, lockIdx, ShareableMap.WRITE_LOCK_VALUE, timeout - elapsed);
         }
     }
 
@@ -863,65 +873,60 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         }
 
         const int32Array = new Int32Array(this.indexMem);
+        const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
 
-        // Decrement the read count
-        const readCount = Atomics.sub(int32Array, ShareableMap.INDEX_READ_COUNT_OFFSET / 4, 1) - 1;
-
-        // If this was the last read lock, update the state and notify waiters
-        if (readCount === 0) {
-            Atomics.store(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, ShareableMap.LOCK_STATE.UNLOCKED);
-            // Notify all waiters that the state has changed
-            Atomics.notify(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, Infinity);
+        // Decrement the reader count. Atomics.sub returns the value *before* subtraction,
+        // so a result of 1 means the count just reached 0 — we were the last reader.
+        const previous = Atomics.sub(int32Array, lockIdx, 1);
+        if (previous === 1) {
+            // No more active readers; wake any writers that are parked waiting for 0
+            Atomics.notify(int32Array, lockIdx, Infinity);
         }
     }
 
     /**
-     * Acquires an exclusive write lock on the map. No other readers or writers can access
+     * Acquires an exclusive write lock on the map. No readers or other writers may access
      * the map while a write lock is held.
      *
-     * @param timeout Optional timeout in milliseconds. If not provided, will wait indefinitely.
-     * @returns true if the lock was acquired, false if it timed out
+     * The CAS only succeeds when the lock word is exactly 0 (fully unlocked), ensuring
+     * that neither active readers (N > 0) nor another writer (-1) can be present.
+     *
+     * @param timeout Optional timeout in milliseconds. Defaults to 500ms.
+     * @returns true if the lock was acquired
+     * @throws if the timeout expires before the lock is acquired
      */
     public acquireWriteLock(timeout: number = 500): boolean {
         if (!(this.indexMem instanceof SharedArrayBuffer)) {
-            // Locking only works with SharedArrayBuffer
             return true;
         }
 
         const int32Array = new Int32Array(this.indexMem);
-
+        const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
         const startTime = Date.now();
+
         while (true) {
-            // Check if the map is currently unlocked
-            const currentState = Atomics.load(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4);
+            // Attempt to transition from fully-unlocked (0) to write-locked (-1).
+            // If active readers or another writer are present the CAS will fail.
+            const observed = Atomics.compareExchange(
+                int32Array,
+                lockIdx,
+                0,
+                ShareableMap.WRITE_LOCK_VALUE
+            );
 
-            if (currentState === ShareableMap.LOCK_STATE.UNLOCKED) {
-                // Try to atomically change state from UNLOCKED to WRITE_LOCKED
-                const exchangedValue = Atomics.compareExchange(
-                    int32Array,
-                    ShareableMap.INDEX_LOCK_OFFSET / 4,
-                    ShareableMap.LOCK_STATE.UNLOCKED,
-                    ShareableMap.LOCK_STATE.WRITE_LOCKED
-                );
-
-                // If exchangedValue is UNLOCKED, we got the lock
-                if (exchangedValue === ShareableMap.LOCK_STATE.UNLOCKED) {
-                    return true;
-                }
+            if (observed === 0) {
+                return true; // CAS succeeded — we hold the write lock
             }
 
-            // If we have a timeout and it's expired, return false
-            if (timeout !== undefined && (Date.now() - startTime) >= timeout) {
+            const elapsed = Date.now() - startTime;
+            if (elapsed >= timeout) {
                 throw new Error("ShareableMap: timeout expired while waiting for write lock.");
             }
 
-            // Wait for a notification that the lock state has changed
-            Atomics.wait(
-                int32Array,
-                ShareableMap.INDEX_LOCK_OFFSET / 4,
-                currentState,
-                timeout === undefined ? Infinity : timeout - (Date.now() - startTime)
-            );
+            // Park until the lock word changes (reader leaves or writer releases).
+            // We pass `observed` so we wake as soon as the value changes from whatever
+            // was blocking us.
+            Atomics.wait(int32Array, lockIdx, observed, timeout - elapsed);
         }
     }
 
@@ -934,23 +939,19 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         }
 
         const int32Array = new Int32Array(this.indexMem);
+        const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
 
-        // Set the state to UNLOCKED
-        Atomics.store(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, ShareableMap.LOCK_STATE.UNLOCKED);
-
-        // Notify all waiters that the lock has been released
-        Atomics.notify(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, Infinity);
+        Atomics.store(int32Array, lockIdx, 0);
+        Atomics.notify(int32Array, lockIdx, Infinity);
     }
 
     /**
-     * Initialize lock state in the reset method
-     * Add this to your reset() method
+     * Initialise the lock word to the unlocked state (0).
      */
     private initializeLockState(): void {
         if (this.indexMem instanceof SharedArrayBuffer) {
             const int32Array = new Int32Array(this.indexMem);
-            Atomics.store(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, ShareableMap.LOCK_STATE.UNLOCKED);
-            Atomics.store(int32Array, ShareableMap.INDEX_READ_COUNT_OFFSET / 4, 0);
+            Atomics.store(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, 0);
         }
     }
 }
