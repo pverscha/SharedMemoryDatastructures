@@ -11,13 +11,16 @@ export default class StringEncoder implements Serializable<string> {
     private encoderArray: Uint8Array = new Uint8Array(this.encoderBuffer);
     private currentDecoderBufferSize: number = StringEncoder.ENCODER_BUFFER_SIZE;
 
+    // Checked once at construction time to avoid a property lookup on every encode call.
+    // Safari does not support encodeInto; all other modern environments do.
+    private readonly useEncodeInto: boolean = this.textEncoder.encodeInto !== undefined;
+
     decode(buffer: Uint8Array): string {
         return this.textDecoder.decode(buffer);
     }
 
     encode(stringValue: string, destination: Uint8Array): number {
-        // Safari does not support the encodeInto function
-        if (this.textEncoder.encodeInto !== undefined) {
+        if (this.useEncodeInto) {
             const maxStringLength = stringValue.length * 3;
 
             if (this.currentDecoderBufferSize < maxStringLength) {

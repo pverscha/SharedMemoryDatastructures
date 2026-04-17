@@ -60,6 +60,11 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
     private indexView!: DataView;
     private dataView!: DataView;
 
+    // Cached Int32 view of the index buffer — used exclusively for Atomics lock operations.
+    // The lock word sits at a fixed offset in the metadata region, so this view never needs
+    // to be refreshed even after SharedArrayBuffer.grow() calls.
+    private int32LockArray: Int32Array | null = null;
+
     private textDecoder: TextDecoder = new TextDecoder();
 
     private readonly stringEncoder = new StringEncoder();
@@ -160,6 +165,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
     protected setBuffers(indexBuffer: SharedArrayBuffer | ArrayBuffer, dataBuffer: SharedArrayBuffer | ArrayBuffer) {
         this.indexMem = indexBuffer;
         this.indexView = new DataView(this.indexMem);
+        this.int32LockArray = indexBuffer instanceof SharedArrayBuffer ? new Int32Array(indexBuffer) : null;
         this.dataMem = dataBuffer;
         this.dataView = new DataView(this.dataMem);
     }
@@ -384,28 +390,36 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         }
 
         if (needsToBeStored) {
+            // Read freeStart once into a local to avoid repeated getUint32 calls on the shared buffer.
+            let freeStart = this.freeStart;
+
             // Determine if the data storage needs to be resized.
-            if (maxKeyLength + maxValueLength + this.freeStart + ShareableMap.DATA_OBJECT_OFFSET > this.dataView.byteLength) {
+            if (maxKeyLength + maxValueLength + freeStart + ShareableMap.DATA_OBJECT_OFFSET > this.dataView.byteLength) {
                 // We don't have enough space left at the end of the data array. We should now consider if we should just
                 // perform a defragmentation of the data array, or if we need to double the size of the array.
-                const defragRatio = this.spaceUsedInDataPartition / this.dataView.byteLength;
+                const usedSpace = this.spaceUsedInDataPartition;
+                const defragRatio = usedSpace / this.dataView.byteLength;
 
                 if (
                     defragRatio < ShareableMap.MIN_DEFRAG_FACTOR &&
-                    this.spaceUsedInDataPartition + maxKeyLength + maxValueLength + ShareableMap.DATA_OBJECT_OFFSET < this.dataView.byteLength
+                    usedSpace + maxKeyLength + maxValueLength + ShareableMap.DATA_OBJECT_OFFSET < this.dataView.byteLength
                 ) {
                     this.defragment();
                 } else {
                     this.doubleDataStorage();
                 }
 
+                // Re-read freeStart: defragment() compacts and updates it; doubleDataStorage() may
+                // have changed the DataView but freeStart stays the same (no re-read strictly needed
+                // after grow, but we keep it uniform).
+                freeStart = this.freeStart;
             }
 
             const exactKeyLength = this.stringEncoder.encode(
                 keyString,
                 new Uint8Array(
                     this.dataMem,
-                    ShareableMap.DATA_OBJECT_OFFSET + this.freeStart,
+                    ShareableMap.DATA_OBJECT_OFFSET + freeStart,
                     maxKeyLength
                 )
             );
@@ -414,24 +428,25 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
                 value,
                 new Uint8Array(
                     this.dataMem,
-                    ShareableMap.DATA_OBJECT_OFFSET + this.freeStart + exactKeyLength,
+                    ShareableMap.DATA_OBJECT_OFFSET + freeStart + exactKeyLength,
                     maxValueLength
                 )
             );
 
             // Store key length
-            this.dataView.setUint32(this.freeStart + 4, exactKeyLength);
+            this.dataView.setUint32(freeStart + 4, exactKeyLength);
             // Store value length
-            this.dataView.setUint32(this.freeStart + 8, exactValueLength);
+            this.dataView.setUint32(freeStart + 8, exactValueLength);
             // Keep track of key and value datatypes
-            this.dataView.setUint16(this.freeStart + 12, typeof key === "string" ? 1 : 0);
-            this.dataView.setUint16(this.freeStart + 14, valueEncoderId);
-            this.dataView.setUint32(this.freeStart + 16, hash);
+            this.dataView.setUint16(freeStart + 12, typeof key === "string" ? 1 : 0);
+            this.dataView.setUint16(freeStart + 14, valueEncoderId);
+            this.dataView.setUint32(freeStart + 16, hash);
 
-            this.spaceUsedInDataPartition += ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
+            const itemSize = ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
+            this.spaceUsedInDataPartition += itemSize;
 
-            startPos = this.freeStart;
-            this.freeStart += ShareableMap.DATA_OBJECT_OFFSET + exactKeyLength + exactValueLength;
+            startPos = freeStart;
+            this.freeStart = freeStart + itemSize;
 
             // Increase size of the map since we added a new element.
             this.increaseSize();
@@ -439,11 +454,12 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
             const bucketPointer = this.indexView.getUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET);
             if (bucketPointer === 0) {
                 this.incrementBucketsInUse();
-                this.indexView.setUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET, startPos);
+                // next pointer at startPos is already 0 (zero-initialised data region)
             } else {
-                // Update linked list pointers
-                this.updateLinkedPointer(bucketPointer, startPos, this.dataView);
+                // Prepend: new item's next points to the current chain head — O(1) vs O(chain)
+                this.dataView.setUint32(startPos, bucketPointer);
             }
+            this.indexView.setUint32(bucket + ShareableMap.INDEX_TABLE_OFFSET, startPos);
 
             // If the load factor exceeds the recommended value, we need to rehash the map to make sure performance stays
             // acceptable.
@@ -550,8 +566,9 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
     private computeHashAndBucket(key: string): [number, number] {
         const hash: number = fast1a32(key);
-        // Bucket in which this value should be stored.
-        const bucket = (hash % this.buckets) * ShareableMap.INT_SIZE;
+        // Bucket in which this value should be stored. Because the bucket count is always a
+        // power of two, a bitwise AND mask is equivalent to modulo and avoids integer division.
+        const bucket = (hash & (this.buckets - 1)) * ShareableMap.INT_SIZE;
         return [hash, bucket];
     }
 
@@ -578,20 +595,13 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
                 const totalLength = keyLength + valueLength + ShareableMap.DATA_OBJECT_OFFSET;
 
-                for (let i = 0; i < totalLength; i++) {
-                    newView.setUint8(newOffset + i, this.dataView.getUint8(dataPointer + i));
-                }
+                new Uint8Array(newData, newOffset, totalLength)
+                    .set(new Uint8Array(this.dataMem, dataPointer, totalLength));
 
-                // Pointer to next block is zero
-                newView.setUint32(newOffset, 0);
-
+                // Prepend this item at the head of the bucket's chain in the new layout.
                 const currentBucketLink = this.indexView.getUint32(ShareableMap.INDEX_TABLE_OFFSET + bucket * ShareableMap.INT_SIZE);
-                if (currentBucketLink === 0) {
-                    this.indexView.setUint32(ShareableMap.INDEX_TABLE_OFFSET + bucket * ShareableMap.INT_SIZE, newOffset);
-                } else {
-                    // We need to follow the links from the first block here and update those.
-                    this.updateLinkedPointer(currentBucketLink, newOffset, newView);
-                }
+                newView.setUint32(newOffset, currentBucketLink);
+                this.indexView.setUint32(ShareableMap.INDEX_TABLE_OFFSET + bucket * ShareableMap.INT_SIZE, newOffset);
 
                 newOffset += totalLength;
                 dataPointer = this.dataView.getUint32(dataPointer);
@@ -651,21 +661,22 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
             );
             while (startPos !== 0) {
                 const hash      = this.readHashFromDataObject(startPos);
-                const newBucket = hash % newBuckets;
+                const newBucket = hash & (newBuckets - 1);
                 const existing  = tempView.getUint32(
                     ShareableMap.INDEX_TABLE_OFFSET + newBucket * ShareableMap.INT_SIZE
                 );
+                const next = this.dataView.getUint32(startPos);
                 if (existing === 0) {
                     bucketsInUse++;
-                    tempView.setUint32(
-                        ShareableMap.INDEX_TABLE_OFFSET + newBucket * ShareableMap.INT_SIZE,
-                        startPos
-                    );
+                    this.dataView.setUint32(startPos, 0); // terminate chain
                 } else {
-                    this.updateLinkedPointer(existing, startPos, this.dataView);
+                    // Prepend: new item's next points to current head — O(1)
+                    this.dataView.setUint32(startPos, existing);
                 }
-                const next = this.dataView.getUint32(startPos);
-                this.dataView.setUint32(startPos, 0);
+                tempView.setUint32(
+                    ShareableMap.INDEX_TABLE_OFFSET + newBucket * ShareableMap.INT_SIZE,
+                    startPos
+                );
                 startPos = next;
             }
         }
@@ -828,7 +839,12 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
         // Fourth set of 4 bytes keep tracks of the DataBuffer's length.
         // Fifth set of 4 bytes keeps track of the space that's being used in total (to track the defrag factor).
         // Rest of the index maps buckets onto their starting position in the data array.
-        const buckets = Math.ceil(expectedSize / ShareableMap.LOAD_FACTOR)
+        //
+        // Round up to the next power of two so computeHashAndBucket can use a fast bitwise
+        // AND mask instead of modulo. doubleIndexStorage always doubles, so subsequent counts
+        // remain powers of two as well.
+        const rawBuckets = Math.ceil(expectedSize / ShareableMap.LOAD_FACTOR);
+        const buckets = rawBuckets <= 1 ? 1 : 2 ** Math.ceil(Math.log2(rawBuckets));
         const indexSize = 5 * 4 + buckets * ShareableMap.INT_SIZE;
 
         const maxDataBytes  = this.originalOptions.maxBytes ?? ShareableMap.DEFAULT_MAX_DATA_BYTES;
@@ -836,6 +852,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
 
         this.indexMem = this.allocateMemory(indexSize, maxIndexBytes);
         this.indexView = new DataView(this.indexMem);
+        this.int32LockArray = this.indexMem instanceof SharedArrayBuffer ? new Int32Array(this.indexMem) : null;
 
         // Free space starts from position 1 in the data array (instead of 0, which we use to indicate the end).
         this.indexView.setUint32(ShareableMap.INDEX_FREE_START_INDEX_OFFSET, ShareableMap.INITIAL_DATA_OFFSET);
@@ -868,7 +885,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
             return true;
         }
 
-        const int32Array = new Int32Array(this.indexMem);
+        const int32Array = this.int32LockArray!;
         const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
         const startTime = Date.now();
 
@@ -907,7 +924,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
             return;
         }
 
-        const int32Array = new Int32Array(this.indexMem);
+        const int32Array = this.int32LockArray!;
         const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
 
         // Decrement the reader count. Atomics.sub returns the value *before* subtraction,
@@ -935,7 +952,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
             return true;
         }
 
-        const int32Array = new Int32Array(this.indexMem);
+        const int32Array = this.int32LockArray!;
         const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
         const startTime = Date.now();
 
@@ -973,7 +990,7 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
             return;
         }
 
-        const int32Array = new Int32Array(this.indexMem);
+        const int32Array = this.int32LockArray!;
         const lockIdx = ShareableMap.INDEX_LOCK_OFFSET / 4;
 
         Atomics.store(int32Array, lockIdx, 0);
@@ -984,9 +1001,8 @@ export class ShareableMap<K, V> extends TransferableDataStructure {
      * Initialise the lock word to the unlocked state (0).
      */
     private initializeLockState(): void {
-        if (this.indexMem instanceof SharedArrayBuffer) {
-            const int32Array = new Int32Array(this.indexMem);
-            Atomics.store(int32Array, ShareableMap.INDEX_LOCK_OFFSET / 4, 0);
+        if (this.int32LockArray !== null) {
+            Atomics.store(this.int32LockArray, ShareableMap.INDEX_LOCK_OFFSET / 4, 0);
         }
     }
 }
